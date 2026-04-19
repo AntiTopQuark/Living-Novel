@@ -226,6 +226,7 @@ class DirectorDecision:
     state_delta: dict[str, Any] = field(default_factory=dict)
     conflict: str | None = None
     rationale: str = ""
+    confidence: float = 1.0
 
     @classmethod
     def from_payload(
@@ -256,6 +257,12 @@ class DirectorDecision:
             conflict_value = None
 
         rationale = _as_text(payload.get("rationale", "")).strip()
+        confidence = payload.get("confidence", 1.0)
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 1.0
+        confidence_value = max(0.0, min(confidence_value, 1.0))
 
         return cls(
             accepted=accepted_value,
@@ -263,6 +270,7 @@ class DirectorDecision:
             state_delta=state_delta,
             conflict=conflict_value,
             rationale=rationale,
+            confidence=confidence_value,
         )
 
 

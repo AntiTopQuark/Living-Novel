@@ -1,6 +1,14 @@
 # Living-Novel
 活书，每个角色有自己的Memory，有自己单独的Agent控制，整个小说或者文章的角色都是鲜活的。
 
+## Dependency Install
+
+```bash
+pip install -r requirements.txt
+# 开发与测试可额外安装
+pip install -r requirements-dev.txt
+```
+
 ## Common LLM Module
 
 新增了一个通用 Python 模块：`common.llm`，用于多个 Agent 共享大模型调用能力。
@@ -98,8 +106,10 @@ print(result.status, result.turns, result.final_state)
 
 接口：
 - `GET /api/books`
-- `POST /api/books`
+- `POST /api/books`（新书需携带 `profile` 8 字段）
 - `POST /api/books/{book_id}/activate`
+- `GET /api/books/{book_id}/profile`
+- `PATCH /api/books/{book_id}/profile`
 - `GET /api/dashboard/kpis?book_id=...`
 - `GET /api/dashboard/scenes?book_id=...`
 - `GET /api/dashboard/scenes/{scene_id}/turns?book_id=...`
@@ -113,6 +123,12 @@ print(result.status, result.turns, result.final_state)
 ```bash
 .venv/bin/python -m uvicorn common.webapi.dashboard_api:app --reload --host 127.0.0.1 --port 8000
 ```
+
+一键启动（推荐）：
+```bash
+python scripts/dev_up.py
+```
+该命令会同时启动后端与前端；若 `frontend/dashboard/node_modules` 缺失，会自动执行一次 `npm install`。
 
 可选环境变量：
 - `LIVING_NOVEL_URLS_CONFIG`
@@ -134,6 +150,11 @@ cd frontend/dashboard
 npm install
 npm run dev
 ```
+
+页面新增“新建书籍向导”：
+- 新建书籍时必须填写 8 项信息：`background/worldview/era_setting/genre/protagonist/protagonist_goal/core_conflict/narrative_style`
+- 支持在 Overview 页编辑当前书籍设定
+- `start` 与 `start_async` 会自动将书籍设定注入场景上下文（若旧书未补全设定则跳过注入，不阻断运行）
 
 默认访问地址：
 - 前端：`http://127.0.0.1:5173`

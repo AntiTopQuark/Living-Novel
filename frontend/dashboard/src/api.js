@@ -47,6 +47,24 @@ export const dashboardApi = {
       method: 'POST',
     })
   },
+  getBookProfile(bookId) {
+    return request(`/api/books/${encodeURIComponent(bookId)}/profile`)
+  },
+  patchBookProfile(bookId, payload) {
+    return request(`/api/books/${encodeURIComponent(bookId)}/profile`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    })
+  },
+  getInteractiveSettings(bookId) {
+    return request(`/api/books/${encodeURIComponent(bookId)}/interactive-settings`)
+  },
+  patchInteractiveSettings(bookId, payload) {
+    return request(`/api/books/${encodeURIComponent(bookId)}/interactive-settings`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    })
+  },
   getKpis(bookId) {
     return request(withQuery('/api/dashboard/kpis', { book_id: bookId }))
   },
@@ -76,6 +94,39 @@ export const dashboardApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     })
+  },
+  startSceneAsync(payload) {
+    return request('/api/control/scenes/start_async', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  getSceneRun(sceneId, bookId) {
+    return request(
+      withQuery(`/api/control/scenes/${encodeURIComponent(sceneId)}/run`, { book_id: bookId }),
+    )
+  },
+  interruptScene(sceneId, payload) {
+    return request(`/api/control/scenes/${encodeURIComponent(sceneId)}/interrupt`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  getPendingDecision(sceneId, bookId) {
+    return request(
+      withQuery(`/api/control/scenes/${encodeURIComponent(sceneId)}/decisions/pending`, {
+        book_id: bookId,
+      }),
+    )
+  },
+  selectDecision(sceneId, requestId, payload) {
+    return request(
+      `/api/control/scenes/${encodeURIComponent(sceneId)}/decisions/${encodeURIComponent(requestId)}/select`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    )
   },
   pauseScene(sceneId, bookId, message = '') {
     return request(`/api/control/scenes/${encodeURIComponent(sceneId)}/pause`, {

@@ -93,11 +93,52 @@ button {
   letter-spacing: 0.08em;
 }
 
-.book-create {
+.book-create,
+.book-create-actions {
   width: 100%;
   max-width: 560px;
+}
+
+.book-create {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+}
+
+.book-create-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-alert {
+  color: var(--accent-2);
+  font-size: 12px;
+}
+
+.interactive-settings {
+  width: 100%;
+  max-width: 560px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.settings-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.settings-timeout {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: 1fr auto;
   gap: 8px;
 }
 
@@ -246,6 +287,11 @@ button {
   font-size: 20px;
 }
 
+.inline-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
 .cost-scope-toggle {
   display: flex;
   gap: 8px;
@@ -339,6 +385,22 @@ button {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.profile-grid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.profile-empty {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .scene-layout {
   margin-top: 18px;
   display: grid;
@@ -417,6 +479,44 @@ button {
   font-size: 14px;
 }
 
+.run-status-box {
+  margin-top: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.run-status-box p {
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+.decision-card {
+  margin-top: 10px;
+  border: 1px solid rgba(255, 191, 70, 0.55);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(255, 191, 70, 0.12);
+}
+
+.decision-card h3 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.decision-card p {
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+.decision-options {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .text-input {
   width: 100%;
   margin-top: 6px;
@@ -490,6 +590,56 @@ button {
   color: var(--muted);
 }
 
+.wizard-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 40px 18px;
+  z-index: 20;
+  overflow-y: auto;
+}
+
+.wizard-modal {
+  width: min(920px, 96vw);
+  border: 1px solid var(--border);
+  background: rgba(8, 18, 26, 0.95);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: var(--shadow);
+}
+
+.wizard-form {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.wizard-section {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.wizard-section h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.wizard-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.wizard-actions {
+  justify-content: flex-end;
+}
+
 @media (max-width: 1220px) {
   .scene-layout {
     grid-template-columns: 1fr;
@@ -508,13 +658,18 @@ button {
 
   .topbar-side,
   .book-switcher,
-  .book-create {
+  .book-create,
+  .book-create-actions {
     max-width: none;
     width: 100%;
   }
 
   .book-create {
     grid-template-columns: 1fr;
+  }
+
+  .book-create-actions {
+    justify-content: flex-start;
   }
 
   .panel-grid,
@@ -524,5 +679,10 @@ button {
 
   .span-two {
     grid-column: span 1;
+  }
+
+  .profile-grid,
+  .wizard-grid {
+    grid-template-columns: 1fr;
   }
 }

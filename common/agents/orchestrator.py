@@ -456,7 +456,7 @@ class SceneOrchestrator:
         system_prompt = (
             "你是导演 Agent，负责裁决角色行动是否与剧情一致。"
             "你必须输出 JSON object。"
-            "字段: accepted(bool), resolved_action(object), state_delta(object), conflict(string|null), rationale(string)。"
+            "字段: accepted(bool), resolved_action(object), state_delta(object), conflict(string|null), rationale(string), confidence(number,0-1)。"
             "若通过动作，resolved_action 可与输入一致；若冲突请修正。"
         )
 
@@ -508,7 +508,8 @@ class SceneOrchestrator:
                             "content": (
                                 "你的输出未通过 JSON/字段校验。"
                                 f"错误: {exc}. "
-                                "请返回合法 JSON，字段必须包含 accepted,resolved_action,state_delta,conflict,rationale。"
+                                "请返回合法 JSON，字段必须包含 "
+                                "accepted,resolved_action,state_delta,conflict,rationale,confidence。"
                             ),
                         },
                     ]
@@ -520,6 +521,7 @@ class SceneOrchestrator:
             state_delta={"director_fallback": True},
             conflict=f"director_output_invalid: {last_error}",
             rationale="Director fallback: invalid model output",
+            confidence=0.0,
         )
 
     def _persist_turn(self, book_id: str, scene_id: str, turn_log: TurnLog) -> None:
@@ -530,6 +532,7 @@ class SceneOrchestrator:
             "state_delta": turn_log.decision.state_delta,
             "conflict": turn_log.decision.conflict,
             "rationale": turn_log.decision.rationale,
+            "confidence": turn_log.decision.confidence,
         }
         self._memory_store.append_turn_log(
             book_id=book_id,

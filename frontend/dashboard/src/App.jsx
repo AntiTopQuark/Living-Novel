@@ -21,6 +21,36 @@ const initialStartForm = {
   max_turns: 6,
 }
 
+const BOOK_PROFILE_FIELDS = [
+  { key: 'background', label: '背景', placeholder: '故事的基础背景与起点' },
+  { key: 'worldview', label: '世界观', placeholder: '规则体系、超自然/科技设定等' },
+  { key: 'era_setting', label: '时代设定', placeholder: '古代/近未来/现代等时间维度' },
+  { key: 'genre', label: '题材类型', placeholder: '悬疑、奇幻、都市等' },
+  { key: 'protagonist', label: '主角', placeholder: '主角身份与核心特征' },
+  { key: 'protagonist_goal', label: '主角目标', placeholder: '主角长期或当前最想达成的目标' },
+  { key: 'core_conflict', label: '核心冲突', placeholder: '最关键矛盾与阻力' },
+  { key: 'narrative_style', label: '叙事风格', placeholder: '第一人称、冷峻、黑色幽默等' },
+]
+
+function buildEmptyBookProfile() {
+  return BOOK_PROFILE_FIELDS.reduce((acc, field) => {
+    acc[field.key] = ''
+    return acc
+  }, {})
+}
+
+function profilePayloadFromDraft(draft) {
+  return BOOK_PROFILE_FIELDS.reduce((acc, field) => {
+    acc[field.key] = String(draft[field.key] || '').trim()
+    return acc
+  }, {})
+}
+
+function isProfileCompleted(profile) {
+  if (!profile || !profile.completed) return false
+  return BOOK_PROFILE_FIELDS.every((field) => String(profile[field.key] || '').trim())
+}
+
 function formatPct(value) {
   return `${(Number(value || 0) * 100).toFixed(1)}%`
 }
@@ -51,6 +81,14 @@ function buildBookRoute(bookId, tab) {
   return `/books/${safeBook}/${safeTab}`
 }
 
+function formatCountdown(seconds) {
+  const safe = Math.max(0, Number(seconds || 0))
+  if (safe < 60) return `${safe}s`
+  const mins = Math.floor(safe / 60)
+  const secs = safe % 60
+  return `${mins}m ${secs}s`
+}
+
 function DashboardApp() {
   const navigate = useNavigate()
   const location = useLocation()
@@ -63,11 +101,15 @@ function DashboardApp() {
   const [sceneFilter, setSceneFilter] = useState('')
   const [startForm, setStartForm] = useState(initialStartForm)
   const [controlMessage, setControlMessage] = useState('')
+  const [interruptIdea, setInterruptIdea] = useState('')
   const [notice, setNotice] = useState('')
   const [controlBusy, setControlBusy] = useState(false)
-  const [newBookId, setNewBookId] = useState('')
-  const [newBookTitle, setNewBookTitle] = useState('')
+  const [wizardOpen, setWizardOpen] = useState(false)
+  const [wizardMode, setWizardMode] = useState('create')
+  const [bookDraft, setBookDraft] = useState({ book_id: '', title: '' })
+  const [profileDraft, setProfileDraft] = useState(buildEmptyBookProfile())
   const [costScope, setCostScope] = useState('current')
+  const [timeoutDraft, setTimeoutDraft] = useState('60')
 
   const booksQuery = usePollingQuery(() => dashboardApi.getBooks(), [], 5000)
   const books = booksQuery.data?.items ?? []
@@ -75,6 +117,10 @@ function DashboardApp() {
 
   const firstBookId = books[0]?.book_id || 'default_book'
   const currentBookId = routeBookId || firstBookId
+  const currentBook = useMemo(
+    () => books.find((item) => item.book_id === currentBookId) || null,
+    [books, currentBookId],
+  )
 
   useEffect(() => {
     if (!routeBookId) {
@@ -97,8 +143,27 @@ function DashboardApp() {
     setSelectedSceneId('')
     setSceneFilter('')
     setControlMessage('')
+    setInterruptIdea('')
     setNotice('')
+    setWizardOpen(false)
   }, [currentBookId])
+
+  const settingsQuery = usePollingQuery(
+    currentBookId ? () => dashboardApi.getInteractiveSettings(currentBookId) : null,
+    [currentBookId],
+    5000,
+  )
+  const profileQuery = usePollingQuery(
+    currentBookId ? () => dashboardApi.getBookProfile(currentBookId) : null,
+    [currentBookId],
+    5000,
+  )
+
+  useEffect(() => {
+    const value = settingsQuery.data?.decision_timeout_seconds
+    if (value == null) return
+    setTimeoutDraft(String(value))
+  }, [settingsQuery.data?.decision_timeout_seconds])
 
   const kpisQuery = usePollingQuery(
     currentBookId ? () => dashboardApi.getKpis(currentBookId) : null,
@@ -120,18 +185,57 @@ function DashboardApp() {
     [currentBookId, costScope],
     5000,
   )
+
+  const runStatusBootstrapQuery = usePollingQuery(
+    selectedSceneId && currentBookId
+      ? () => dashboardApi.getSceneRun(selectedSceneId, currentBookId)
+      : null,
+    [selectedSceneId, currentBookId],
+    5000,
+  )
+  const hotStatus = runStatusBootstrapQuery.data?.status
+  const isHotPolling = hotStatus === 'running' || hotStatus === 'waiting_user'
+  const scenePollingInterval = isHotPolling ? 1500 : 5000
+
+  const runStatusQuery = usePollingQuery(
+    selectedSceneId && currentBookId
+      ? () => dashboardApi.getSceneRun(selectedSceneId, currentBookId)
+      : null,
+    [selectedSceneId, currentBookId],
+    scenePollingInterval,
+  )
+
   const turnsQuery = usePollingQuery(
     selectedSceneId && currentBookId
       ? () => dashboardApi.getSceneTurns(selectedSceneId, currentBookId)
       : null,
     [selectedSceneId, currentBookId],
-    5000,
+    scenePollingInterval,
+  )
+
+  const pendingDecisionQuery = usePollingQuery(
+    selectedSceneId && currentBookId
+      ? () => dashboardApi.getPendingDecision(selectedSceneId, currentBookId)
+      : null,
+    [selectedSceneId, currentBookId],
+    scenePollingInterval,
   )
 
   const scenes = scenesQuery.data?.items ?? []
   const agents = agentsQuery.data?.items ?? []
   const costs = costsQuery.data ?? { series: [], by_agent: [] }
   const turns = turnsQuery.data?.items ?? []
+  const runStatus = runStatusQuery.data
+  const pendingDecision = pendingDecisionQuery.data?.item || null
+  const settings = settingsQuery.data ?? {
+    uncertainty_enabled: false,
+    decision_timeout_seconds: 60,
+  }
+  const currentProfile = profileQuery.data ?? {
+    completed: false,
+    ...buildEmptyBookProfile(),
+  }
+  const currentProfileCompleted = Boolean(currentBook?.profile_completed) || isProfileCompleted(currentProfile)
 
   const filteredScenes = useMemo(() => {
     const keyword = sceneFilter.trim().toLowerCase()
@@ -162,27 +266,39 @@ function DashboardApp() {
 
   const anyLoading =
     booksQuery.loading ||
+    profileQuery.loading ||
+    settingsQuery.loading ||
     kpisQuery.loading ||
     scenesQuery.loading ||
     agentsQuery.loading ||
-    costsQuery.loading
+    costsQuery.loading ||
+    runStatusQuery.loading ||
+    pendingDecisionQuery.loading
 
   const anyError =
     booksQuery.error ||
+    profileQuery.error ||
+    settingsQuery.error ||
     kpisQuery.error ||
     scenesQuery.error ||
     agentsQuery.error ||
     costsQuery.error ||
-    turnsQuery.error
+    turnsQuery.error ||
+    runStatusQuery.error ||
+    pendingDecisionQuery.error
 
   async function refreshAll() {
     await Promise.all([
       booksQuery.refresh(),
+      profileQuery.refresh(),
+      settingsQuery.refresh(),
       kpisQuery.refresh(),
       scenesQuery.refresh(),
       agentsQuery.refresh(),
       costsQuery.refresh(),
       turnsQuery.refresh(),
+      runStatusQuery.refresh(),
+      pendingDecisionQuery.refresh(),
     ])
   }
 
@@ -197,25 +313,101 @@ function DashboardApp() {
     await refreshAll()
   }
 
-  async function handleCreateBook(event) {
+  function openCreateWizard() {
+    setWizardMode('create')
+    setBookDraft({ book_id: '', title: '' })
+    setProfileDraft(buildEmptyBookProfile())
+    setWizardOpen(true)
+  }
+
+  function openEditWizard() {
+    const baseProfile = BOOK_PROFILE_FIELDS.reduce((acc, field) => {
+      acc[field.key] = String(currentProfile[field.key] || '')
+      return acc
+    }, {})
+    setWizardMode('edit')
+    setBookDraft({
+      book_id: currentBookId,
+      title: currentBook?.title || currentBookId,
+    })
+    setProfileDraft(baseProfile)
+    setWizardOpen(true)
+  }
+
+  async function handleWizardSubmit(event) {
     event.preventDefault()
-    const bookId = newBookId.trim()
-    const title = newBookTitle.trim() || bookId
-    if (!bookId) {
-      setNotice('book_id 不能为空')
+    const profilePayload = profilePayloadFromDraft(profileDraft)
+    const emptyField = BOOK_PROFILE_FIELDS.find((field) => !profilePayload[field.key])
+    if (emptyField) {
+      setNotice(`${emptyField.label} 不能为空`)
       return
     }
 
     setControlBusy(true)
     setNotice('')
     try {
-      await dashboardApi.createBook({ book_id: bookId, title })
-      await dashboardApi.activateBook(bookId)
-      setNewBookId('')
-      setNewBookTitle('')
-      setNotice(`书籍 ${bookId} 已创建并激活`)
-      navigate(buildBookRoute(bookId, tab))
+      if (wizardMode === 'create') {
+        const bookId = String(bookDraft.book_id || '').trim()
+        const title = String(bookDraft.title || '').trim() || bookId
+        if (!bookId) {
+          throw new Error('book_id 不能为空')
+        }
+        await dashboardApi.createBook({
+          book_id: bookId,
+          title,
+          profile: profilePayload,
+        })
+        await dashboardApi.activateBook(bookId)
+        setNotice(`书籍 ${bookId} 已创建并切换`)
+        setWizardOpen(false)
+        navigate(buildBookRoute(bookId, tab))
+      } else {
+        await dashboardApi.patchBookProfile(currentBookId, profilePayload)
+        setNotice(`书籍 ${currentBookId} 设定已更新`)
+        setWizardOpen(false)
+      }
       await refreshAll()
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  async function handleToggleUncertainty(event) {
+    setControlBusy(true)
+    setNotice('')
+    try {
+      const enabled = Boolean(event.target.checked)
+      const updated = await dashboardApi.patchInteractiveSettings(currentBookId, {
+        uncertainty_enabled: enabled,
+      })
+      setNotice(
+        `书籍 ${currentBookId} 不确定询问开关已${updated.uncertainty_enabled ? '开启' : '关闭'}`,
+      )
+      await settingsQuery.refresh()
+    } catch (error) {
+      setNotice(error.message)
+      event.target.checked = settings.uncertainty_enabled
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  async function handleUpdateTimeout() {
+    setControlBusy(true)
+    setNotice('')
+    try {
+      const timeout = Number(timeoutDraft)
+      if (!Number.isFinite(timeout) || timeout < 5 || timeout > 3600) {
+        throw new Error('超时时间必须在 5-3600 秒之间')
+      }
+      const updated = await dashboardApi.patchInteractiveSettings(currentBookId, {
+        decision_timeout_seconds: timeout,
+      })
+      setTimeoutDraft(String(updated.decision_timeout_seconds))
+      setNotice(`书籍 ${currentBookId} 决策超时已更新为 ${updated.decision_timeout_seconds} 秒`)
+      await settingsQuery.refresh()
     } catch (error) {
       setNotice(error.message)
     } finally {
@@ -245,7 +437,7 @@ function DashboardApp() {
         throw new Error('participants 不能为空，使用逗号分隔角色 agent_id')
       }
 
-      const response = await dashboardApi.startScene({
+      const response = await dashboardApi.startSceneAsync({
         book_id: currentBookId,
         scene_id: startForm.scene_id.trim(),
         title: startForm.title.trim(),
@@ -257,7 +449,7 @@ function DashboardApp() {
       })
 
       setNotice(
-        `书籍 ${response.book_id} 场景 ${response.scene_id} 已执行，状态 ${response.status}，回合 ${response.turns}`,
+        `书籍 ${response.book_id} 场景 ${response.scene_id} 已异步启动，run_id=${response.run_id}`,
       )
       setSelectedSceneId(response.scene_id)
       await refreshAll()
@@ -295,7 +487,53 @@ function DashboardApp() {
     setNotice('')
     try {
       const result = await dashboardApi.resumeScene(selectedSceneId, currentBookId, controlMessage)
-      setNotice(`书籍 ${result.book_id} 场景 ${result.scene_id} 已恢复到可执行状态`)
+      setNotice(`书籍 ${result.book_id} 场景 ${result.scene_id} 已恢复到运行状态`)
+      await refreshAll()
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  async function handleInterrupt() {
+    if (!selectedSceneId) {
+      setNotice('请先选择场景再打断')
+      return
+    }
+    const idea = interruptIdea.trim()
+    if (!idea) {
+      setNotice('请先输入创作者想法')
+      return
+    }
+
+    setControlBusy(true)
+    setNotice('')
+    try {
+      await dashboardApi.interruptScene(selectedSceneId, {
+        book_id: currentBookId,
+        idea,
+      })
+      setInterruptIdea('')
+      setNotice('已提交打断想法，系统将重算当前回合')
+      await refreshAll()
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  async function handleSelectDecision(optionId) {
+    if (!selectedSceneId || !pendingDecision?.request_id) return
+    setControlBusy(true)
+    setNotice('')
+    try {
+      await dashboardApi.selectDecision(selectedSceneId, pendingDecision.request_id, {
+        book_id: currentBookId,
+        selected_option: optionId,
+      })
+      setNotice(`已提交决策选项: ${optionId}`)
       await refreshAll()
     } catch (error) {
       setNotice(error.message)
@@ -342,28 +580,45 @@ function DashboardApp() {
               ))}
             </select>
           </div>
-          <form className="book-create" onSubmit={handleCreateBook}>
-            <input
-              className="text-input"
-              value={newBookId}
-              onChange={(event) => setNewBookId(event.target.value)}
-              placeholder="新 book_id"
-              aria-label="新书 book_id"
-            />
-            <input
-              className="text-input"
-              value={newBookTitle}
-              onChange={(event) => setNewBookTitle(event.target.value)}
-              placeholder="新书标题"
-              aria-label="新书标题"
-            />
-            <button type="submit" className="btn primary" disabled={controlBusy}>
-              创建并切换
+          <div className="book-create-actions">
+            <button type="button" className="btn primary" onClick={openCreateWizard} disabled={controlBusy}>
+              新建书籍向导
             </button>
-          </form>
+            <button type="button" className="btn" onClick={openEditWizard} disabled={controlBusy}>
+              编辑当前书设定
+            </button>
+            {!currentProfileCompleted ? <span className="profile-alert">当前书籍设定未完善</span> : null}
+          </div>
+
+          <div className="interactive-settings">
+            <label className="settings-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.uncertainty_enabled)}
+                onChange={handleToggleUncertainty}
+                disabled={controlBusy}
+              />
+              不确定时询问用户
+            </label>
+            <div className="settings-timeout">
+              <input
+                className="text-input"
+                type="number"
+                min={5}
+                max={3600}
+                value={timeoutDraft}
+                onChange={(event) => setTimeoutDraft(event.target.value)}
+                aria-label="决策超时秒数"
+              />
+              <button type="button" className="btn" onClick={handleUpdateTimeout} disabled={controlBusy}>
+                更新超时(秒)
+              </button>
+            </div>
+          </div>
+
           <div className="sync-state">
             <span className={anyLoading ? 'pulse-dot' : 'pulse-dot steady'} />
-            <span>{anyLoading ? '数据同步中...' : '实时轮询每 5 秒'}</span>
+            <span>{anyLoading ? '数据同步中...' : `轮询中 (${scenePollingInterval / 1000}s)`}</span>
           </div>
         </div>
       </header>
@@ -396,6 +651,35 @@ function DashboardApp() {
             <KpiCard title="活跃角色" value={kpis.active_agents} hint="最近有行动的角色" />
             <KpiCard title="累计成本" value={`$${formatMoney(kpis.total_cost)}`} hint="usage_events 总成本" />
           </div>
+
+          <article className="card span-two">
+            <header className="card-head">
+              <h2>当前书籍设定</h2>
+              <div className="inline-actions">
+                <button type="button" className="btn" onClick={openEditWizard} disabled={controlBusy}>
+                  编辑设定
+                </button>
+              </div>
+            </header>
+            <p className="muted">book_id: {currentBookId}</p>
+            {!currentProfileCompleted ? (
+              <div className="profile-empty">
+                <p className="muted">当前书籍设定未完善，请先补全 8 项基础信息。</p>
+                <button type="button" className="btn primary" onClick={openEditWizard} disabled={controlBusy}>
+                  立即完善
+                </button>
+              </div>
+            ) : (
+              <div className="profile-grid">
+                {BOOK_PROFILE_FIELDS.map((field) => (
+                  <div key={field.key} className="mini-card">
+                    <h4>{field.label}</h4>
+                    <p>{currentProfile[field.key]}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </article>
 
           <article className="card span-two">
             <header className="card-head">
@@ -519,6 +803,48 @@ function DashboardApp() {
               <h2>回合时间轴</h2>
               <span className="muted">{selectedSceneId || '未选择场景'}</span>
             </header>
+
+            <div className="run-status-box">
+              <p>
+                <b>运行状态:</b> {runStatus?.status || 'idle'}
+              </p>
+              <p>
+                <b>Run ID:</b> {runStatus?.run_id || '-'}
+              </p>
+              <p>
+                <b>进度:</b> {runStatus?.current_turn || 0}/{runStatus?.target_turns || 0}
+              </p>
+              <p>
+                <b>最近错误:</b> {runStatus?.last_error || '-'}
+              </p>
+            </div>
+
+            {pendingDecision ? (
+              <div className="decision-card">
+                <h3>待用户决策</h3>
+                <p>{pendingDecision.question}</p>
+                <p>
+                  <b>剩余时间:</b> {formatCountdown(pendingDecision.remaining_seconds)}
+                </p>
+                <p>
+                  <b>推荐选项:</b> {pendingDecision.recommended_option}
+                </p>
+                <div className="decision-options">
+                  {(pendingDecision.options || []).map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      className="btn"
+                      onClick={() => handleSelectDecision(option.id)}
+                      disabled={controlBusy}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {!selectedSceneId ? (
               <p className="muted">请选择左侧场景查看回合细节。</p>
             ) : turns.length === 0 ? (
@@ -636,10 +962,26 @@ function DashboardApp() {
 
               <div className="control-row">
                 <button type="submit" className="btn primary" disabled={controlBusy}>
-                  开始执行
+                  异步开始执行
                 </button>
               </div>
             </form>
+
+            <label>
+              创作者打断想法
+              <textarea
+                className="text-input"
+                rows={3}
+                value={interruptIdea}
+                onChange={(event) => setInterruptIdea(event.target.value)}
+                placeholder="输入你的临时想法，系统会中断并重算当前回合"
+              />
+            </label>
+            <div className="control-row">
+              <button type="button" className="btn primary" onClick={handleInterrupt} disabled={controlBusy}>
+                打断并重算
+              </button>
+            </div>
 
             <label>
               控制消息
@@ -701,6 +1043,78 @@ function DashboardApp() {
             )}
           </article>
         </section>
+      ) : null}
+
+      {wizardOpen ? (
+        <div className="wizard-backdrop" role="presentation">
+          <div className="wizard-modal">
+            <header className="card-head">
+              <h2>{wizardMode === 'create' ? '新建书籍向导' : '编辑书籍设定'}</h2>
+              <button type="button" className="btn" onClick={() => setWizardOpen(false)} disabled={controlBusy}>
+                关闭
+              </button>
+            </header>
+            <form className="wizard-form" onSubmit={handleWizardSubmit}>
+              <section className="wizard-section">
+                <h3>步骤 1：基础信息</h3>
+                <label>
+                  book_id
+                  <input
+                    className="text-input"
+                    value={bookDraft.book_id}
+                    disabled={wizardMode === 'edit'}
+                    onChange={(event) =>
+                      setBookDraft((prev) => ({ ...prev, book_id: event.target.value }))
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  书籍标题
+                  <input
+                    className="text-input"
+                    value={bookDraft.title}
+                    disabled={wizardMode === 'edit'}
+                    onChange={(event) =>
+                      setBookDraft((prev) => ({ ...prev, title: event.target.value }))
+                    }
+                    required
+                  />
+                </label>
+              </section>
+
+              <section className="wizard-section">
+                <h3>步骤 2：书籍设定（8 项必填）</h3>
+                <div className="wizard-grid">
+                  {BOOK_PROFILE_FIELDS.map((field) => (
+                    <label key={field.key}>
+                      {field.label}
+                      <textarea
+                        className="text-input"
+                        rows={2}
+                        placeholder={field.placeholder}
+                        value={profileDraft[field.key]}
+                        onChange={(event) =>
+                          setProfileDraft((prev) => ({ ...prev, [field.key]: event.target.value }))
+                        }
+                        required
+                      />
+                    </label>
+                  ))}
+                </div>
+              </section>
+
+              <div className="control-row wizard-actions">
+                <button type="submit" className="btn primary" disabled={controlBusy}>
+                  {wizardMode === 'create' ? '创建并切换' : '保存设定'}
+                </button>
+                <button type="button" className="btn" onClick={() => setWizardOpen(false)} disabled={controlBusy}>
+                  取消
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       ) : null}
     </div>
   )
