@@ -85,3 +85,50 @@ scene = SceneInput(
 result = orchestrator.run_scene(scene, agents, max_turns=6)
 print(result.status, result.turns, result.final_state)
 ```
+
+## Progress Dashboard (React + FastAPI)
+
+新增进度看板，支持展示“流程总览 / 场景进度 / 角色进度”，并可执行场景开始、暂停、继续。
+
+### Backend API
+
+- 模块：`common.webapi.dashboard_api`
+- 路由前缀：`/api/*`
+
+接口：
+- `GET /api/dashboard/kpis`
+- `GET /api/dashboard/scenes`
+- `GET /api/dashboard/scenes/{scene_id}/turns`
+- `GET /api/dashboard/agents`
+- `GET /api/dashboard/costs?from=&to=`
+- `POST /api/control/scenes/start`
+- `POST /api/control/scenes/{scene_id}/pause`
+- `POST /api/control/scenes/{scene_id}/resume`
+
+开发启动：
+```bash
+.venv/bin/python -m uvicorn common.webapi.dashboard_api:app --reload --host 127.0.0.1 --port 8000
+```
+
+可选环境变量：
+- `LIVING_NOVEL_URLS_CONFIG`
+- `LIVING_NOVEL_RUNTIME_CONFIG`
+- `LIVING_NOVEL_FACTORY_CONFIG`
+
+### Frontend Dashboard
+
+- 路径：`frontend/dashboard`
+- 技术：React + Vite
+- 数据更新：5 秒轮询
+- 时间显示：浏览器本地时区
+
+开发启动：
+```bash
+cd frontend/dashboard
+npm install
+npm run dev
+```
+
+默认访问地址：
+- 前端：`http://127.0.0.1:5173`
+- 后端：`http://127.0.0.1:8000`
