@@ -94,6 +94,7 @@ class CharacterAgent:
             response = self._llm_manager.chat_sync(
                 LLMRequest(
                     agent_id=self.agent_id,
+                    book_id=scene_context.book_id,
                     messages=messages,
                     temperature=self._action_config.temperature,
                     max_tokens=self._action_config.max_tokens,
@@ -141,6 +142,7 @@ class CharacterAgent:
             response = await self._llm_manager.chat(
                 LLMRequest(
                     agent_id=self.agent_id,
+                    book_id=scene_context.book_id,
                     messages=messages,
                     temperature=self._action_config.temperature,
                     max_tokens=self._action_config.max_tokens,
@@ -196,7 +198,8 @@ class CharacterAgent:
             "[当前场景基线]\n"
             f"{_render_mapping(self.skill.current_scene)}\n\n"
             "[本场景动态信息]\n"
-            f"scene_id={scene_context.scene_id}; title={scene_context.title}; objective={scene_context.objective}\n"
+            f"book_id={scene_context.book_id}; scene_id={scene_context.scene_id}; "
+            f"title={scene_context.title}; objective={scene_context.objective}\n"
             f"context={scene_context.context}\n"
             f"state={scene_context.state}\n"
             f"unresolved_conflicts={scene_context.unresolved_conflicts}\n\n"

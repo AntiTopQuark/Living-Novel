@@ -13,20 +13,47 @@ function jsonResponse(body, status = 200) {
   )
 }
 
+function parseRequest(input) {
+  const raw = String(input)
+  const url = new URL(raw, 'http://localhost')
+  return {
+    pathname: url.pathname,
+    searchParams: url.searchParams,
+  }
+}
+
 describe('Dashboard App', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+    window.history.pushState({}, '', '/')
   })
 
   afterEach(() => {
     vi.clearAllMocks()
   })
 
-  test('renders loading then empty overview state', async () => {
+  test('renders empty overview state with default book routing', async () => {
     const fetchMock = vi.fn((input, init) => {
-      const url = String(input)
-      if (url.endsWith('/api/dashboard/kpis')) {
+      const { pathname, searchParams } = parseRequest(input)
+
+      if (pathname === '/api/books') {
         return jsonResponse({
+          items: [
+            {
+              book_id: 'book_a',
+              title: 'Book A',
+              status: 'active',
+              created_at: '2026-04-19T10:00:00+00:00',
+              updated_at: '2026-04-19T10:00:00+00:00',
+            },
+          ],
+        })
+      }
+
+      if (pathname === '/api/dashboard/kpis') {
+        const bookId = searchParams.get('book_id') || 'default_book'
+        return jsonResponse({
+          book_id: bookId,
           total_scenes: 0,
           completed_scenes: 0,
           completion_rate: 0,
@@ -35,18 +62,28 @@ describe('Dashboard App', () => {
           total_cost: 0,
         })
       }
-      if (url.endsWith('/api/dashboard/scenes')) {
-        return jsonResponse({ items: [] })
+
+      if (pathname === '/api/dashboard/scenes') {
+        return jsonResponse({ book_id: searchParams.get('book_id') || 'default_book', items: [] })
       }
-      if (url.endsWith('/api/dashboard/agents')) {
-        return jsonResponse({ items: [] })
+
+      if (pathname === '/api/dashboard/agents') {
+        return jsonResponse({ book_id: searchParams.get('book_id') || 'default_book', items: [] })
       }
-      if (url.endsWith('/api/dashboard/costs')) {
-        return jsonResponse({ series: [], by_agent: [] })
+
+      if (pathname === '/api/dashboard/costs') {
+        return jsonResponse({
+          book_id: searchParams.get('book_id') || 'default_book',
+          scope: searchParams.get('scope') || 'current',
+          series: [],
+          by_agent: [],
+        })
       }
-      if (init?.method === 'POST') {
+
+      if ((init?.method || 'GET').toUpperCase() === 'POST') {
         return jsonResponse({ ok: true })
       }
+
       return jsonResponse({ scene_id: 'n/a', items: [] })
     })
 
@@ -57,17 +94,46 @@ describe('Dashboard App', () => {
     expect(screen.getByText('数据同步中...')).toBeInTheDocument()
     await screen.findByText('暂无场景数据，先在“场景进度”页启动一次场景。')
     expect(screen.getByText('0.0%')).toBeInTheDocument()
+    expect(screen.getByLabelText('当前书籍')).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe('/books/book_a/overview')
+    })
   })
 
-  test('filters scenes and triggers pause control', async () => {
+  test('filters scenes, pauses selected scene, and switches book', async () => {
+    window.history.pushState({}, '', '/books/book_a/scenes')
+
     const calls = []
     const fetchMock = vi.fn((input, init) => {
-      const url = String(input)
+      const req = parseRequest(input)
       const method = (init?.method || 'GET').toUpperCase()
-      calls.push({ url, method })
+      calls.push({ pathname: req.pathname, search: req.searchParams.toString(), method, body: init?.body })
 
-      if (url.endsWith('/api/dashboard/kpis')) {
+      if (req.pathname === '/api/books') {
         return jsonResponse({
+          items: [
+            {
+              book_id: 'book_a',
+              title: 'Book A',
+              status: 'active',
+              created_at: '2026-04-19T10:00:00+00:00',
+              updated_at: '2026-04-19T10:00:00+00:00',
+            },
+            {
+              book_id: 'book_b',
+              title: 'Book B',
+              status: 'idle',
+              created_at: '2026-04-19T10:00:00+00:00',
+              updated_at: '2026-04-19T10:00:00+00:00',
+            },
+          ],
+        })
+      }
+
+      if (req.pathname === '/api/dashboard/kpis') {
+        return jsonResponse({
+          book_id: req.searchParams.get('book_id') || 'book_a',
           total_scenes: 2,
           completed_scenes: 1,
           completion_rate: 0.5,
@@ -76,10 +142,31 @@ describe('Dashboard App', () => {
           total_cost: 0.013,
         })
       }
-      if (url.endsWith('/api/dashboard/scenes')) {
+
+      if (req.pathname === '/api/dashboard/scenes') {
+        const bookId = req.searchParams.get('book_id') || 'book_a'
+        if (bookId === 'book_b') {
+          return jsonResponse({
+            book_id: 'book_b',
+            items: [
+              {
+                book_id: 'book_b',
+                scene_id: 's-gamma',
+                status: 'ready',
+                total_turns: 1,
+                active_agents: 1,
+                last_actor: 'hero',
+                last_action: '观察',
+                last_updated: '2026-04-19T10:10:00+00:00',
+              },
+            ],
+          })
+        }
         return jsonResponse({
+          book_id: 'book_a',
           items: [
             {
+              book_id: 'book_a',
               scene_id: 's-alpha',
               status: 'ready',
               total_turns: 2,
@@ -89,6 +176,7 @@ describe('Dashboard App', () => {
               last_updated: '2026-04-19T10:00:00+00:00',
             },
             {
+              book_id: 'book_a',
               scene_id: 's-beta',
               status: 'running',
               total_turns: 3,
@@ -100,14 +188,23 @@ describe('Dashboard App', () => {
           ],
         })
       }
-      if (url.endsWith('/api/dashboard/agents')) {
-        return jsonResponse({ items: [] })
+
+      if (req.pathname === '/api/dashboard/agents') {
+        return jsonResponse({ book_id: req.searchParams.get('book_id') || 'book_a', items: [] })
       }
-      if (url.endsWith('/api/dashboard/costs')) {
-        return jsonResponse({ series: [], by_agent: [] })
-      }
-      if (url.endsWith('/api/dashboard/scenes/s-alpha/turns')) {
+
+      if (req.pathname === '/api/dashboard/costs') {
         return jsonResponse({
+          book_id: req.searchParams.get('book_id') || 'book_a',
+          scope: req.searchParams.get('scope') || 'current',
+          series: [],
+          by_agent: [],
+        })
+      }
+
+      if (req.pathname === '/api/dashboard/scenes/s-alpha/turns') {
+        return jsonResponse({
+          book_id: req.searchParams.get('book_id') || 'book_a',
           scene_id: 's-alpha',
           items: [
             {
@@ -121,8 +218,10 @@ describe('Dashboard App', () => {
           ],
         })
       }
-      if (url.endsWith('/api/dashboard/scenes/s-beta/turns')) {
+
+      if (req.pathname === '/api/dashboard/scenes/s-beta/turns') {
         return jsonResponse({
+          book_id: req.searchParams.get('book_id') || 'book_a',
           scene_id: 's-beta',
           items: [
             {
@@ -136,11 +235,23 @@ describe('Dashboard App', () => {
           ],
         })
       }
-      if (url.endsWith('/api/control/scenes/s-beta/pause') && method === 'POST') {
-        return jsonResponse({ scene_id: 's-beta', status: 'paused' })
+
+      if (req.pathname === '/api/control/scenes/s-beta/pause' && method === 'POST') {
+        return jsonResponse({ book_id: 'book_a', scene_id: 's-beta', status: 'paused' })
       }
-      if (url.endsWith('/api/control/scenes/s-beta/resume') && method === 'POST') {
-        return jsonResponse({ scene_id: 's-beta', status: 'ready' })
+
+      if (req.pathname === '/api/books/book_b/activate' && method === 'POST') {
+        return jsonResponse({
+          book_id: 'book_b',
+          title: 'Book B',
+          status: 'active',
+          created_at: '2026-04-19T10:00:00+00:00',
+          updated_at: '2026-04-19T10:15:00+00:00',
+        })
+      }
+
+      if (method === 'POST') {
+        return jsonResponse({ ok: true })
       }
 
       return jsonResponse({})
@@ -149,9 +260,6 @@ describe('Dashboard App', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     render(<App />)
-    await screen.findByText('最近场景进度')
-
-    fireEvent.click(screen.getByRole('button', { name: '场景进度' }))
     await screen.findByText('场景列表')
 
     const filterInput = screen.getByLabelText('场景筛选')
@@ -164,12 +272,34 @@ describe('Dashboard App', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /s-beta/ }))
     await waitFor(() => {
-      expect(calls.some((call) => call.url.endsWith('/api/dashboard/scenes/s-beta/turns'))).toBe(true)
+      expect(
+        calls.some(
+          (call) =>
+            call.pathname === '/api/dashboard/scenes/s-beta/turns' && call.search.includes('book_id=book_a'),
+        ),
+      ).toBe(true)
     })
 
     fireEvent.click(screen.getByRole('button', { name: '暂停' }))
     await waitFor(() => {
-      expect(calls.some((call) => call.url.endsWith('/api/control/scenes/s-beta/pause'))).toBe(true)
+      const pauseCall = calls.find((call) => call.pathname === '/api/control/scenes/s-beta/pause')
+      expect(pauseCall).toBeTruthy()
+      expect(JSON.parse(pauseCall.body)).toMatchObject({ book_id: 'book_a' })
+    })
+
+    fireEvent.change(screen.getByLabelText('当前书籍'), { target: { value: 'book_b' } })
+    await waitFor(() => {
+      expect(
+        calls.some((call) => call.pathname === '/api/books/book_b/activate' && call.method === 'POST'),
+      ).toBe(true)
+    })
+
+    await waitFor(() => {
+      expect(
+        calls.some(
+          (call) => call.pathname === '/api/dashboard/scenes' && call.search.includes('book_id=book_b'),
+        ),
+      ).toBe(true)
     })
   })
 })

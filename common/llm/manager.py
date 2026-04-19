@@ -38,6 +38,7 @@ class UsageReporter:
         start: datetime,
         end: datetime,
         *,
+        book_id: str | None = None,
         agent_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
@@ -46,6 +47,7 @@ class UsageReporter:
         return self._usage_store.query(
             start=start,
             end=end,
+            book_id=book_id,
             agent_id=agent_id,
             provider=provider,
             model=model,
@@ -308,6 +310,7 @@ class LLMClientManager:
 
         return UsageRecord(
             request_id=request_id,
+            book_id=request.book_id,
             agent_id=request.agent_id,
             provider=request.provider or "",
             model=request.model or "",

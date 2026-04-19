@@ -50,6 +50,7 @@ class MemoryStore:
                 """
                 CREATE TABLE IF NOT EXISTS agent_memory_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT NOT NULL DEFAULT 'default_book',
                     agent_id TEXT NOT NULL,
                     scene_id TEXT NOT NULL,
                     turn INTEGER NOT NULL,
@@ -64,6 +65,7 @@ class MemoryStore:
                 """
                 CREATE TABLE IF NOT EXISTS scene_turn_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT NOT NULL DEFAULT 'default_book',
                     scene_id TEXT NOT NULL,
                     turn INTEGER NOT NULL,
                     actor TEXT NOT NULL,
@@ -78,6 +80,7 @@ class MemoryStore:
                 """
                 CREATE TABLE IF NOT EXISTS scene_state_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT NOT NULL DEFAULT 'default_book',
                     scene_id TEXT NOT NULL,
                     turn INTEGER NOT NULL,
                     state_json TEXT NOT NULL,
@@ -85,22 +88,68 @@ class MemoryStore:
                 )
                 """
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_mem_agent_scene ON agent_memory_events(agent_id, scene_id)"
+            self._ensure_column(
+                conn,
+                "agent_memory_events",
+                "book_id",
+                "TEXT NOT NULL DEFAULT 'default_book'",
+            )
+            self._ensure_column(
+                conn,
+                "scene_turn_logs",
+                "book_id",
+                "TEXT NOT NULL DEFAULT 'default_book'",
+            )
+            self._ensure_column(
+                conn,
+                "scene_state_snapshots",
+                "book_id",
+                "TEXT NOT NULL DEFAULT 'default_book'",
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_turn_logs_scene ON scene_turn_logs(scene_id, turn)"
+                "UPDATE agent_memory_events SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
             )
+            conn.execute(
+                "UPDATE scene_turn_logs SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
+            )
+            conn.execute(
+                "UPDATE scene_state_snapshots SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mem_agent_scene ON agent_memory_events(book_id, agent_id, scene_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_turn_logs_scene ON scene_turn_logs(book_id, scene_id, turn)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_scene ON scene_state_snapshots(book_id, scene_id, turn)"
+            )
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_def: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name in columns:
+            return
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
 
     def append(self, event: MemoryEvent) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO agent_memory_events (
-                    agent_id, scene_id, turn, content, importance, tags, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    book_id, agent_id, scene_id, turn, content, importance, tags, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    event.book_id,
                     event.agent_id,
                     event.scene_id,
                     event.turn,
@@ -111,18 +160,25 @@ class MemoryStore:
                 ),
             )
 
-    def retrieve(self, agent_id: str, scene_id: str, top_k: int) -> list[MemoryEvent]:
+    def retrieve(
+        self,
+        agent_id: str,
+        scene_id: str,
+        top_k: int,
+        *,
+        book_id: str = "default_book",
+    ) -> list[MemoryEvent]:
         top_k = max(1, int(top_k))
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT agent_id, scene_id, turn, content, importance, tags, created_at
+                SELECT book_id, agent_id, scene_id, turn, content, importance, tags, created_at
                 FROM agent_memory_events
-                WHERE agent_id = ? AND scene_id = ?
+                WHERE book_id = ? AND agent_id = ? AND scene_id = ?
                 ORDER BY turn DESC, id DESC
                 LIMIT ?
                 """,
-                (agent_id, scene_id, top_k * 5),
+                (book_id, agent_id, scene_id, top_k * 5),
             ).fetchall()
 
         now_turn = max([int(row["turn"]) for row in rows], default=0)
@@ -139,6 +195,7 @@ class MemoryStore:
                 scene_id=row["scene_id"],
                 turn=turn,
                 content=row["content"],
+                book_id=row["book_id"] or "default_book",
                 importance=importance,
                 tags=tags if isinstance(tags, list) else [],
                 created_at=datetime.fromisoformat(row["created_at"]),
@@ -153,6 +210,7 @@ class MemoryStore:
     def append_turn_log(
         self,
         *,
+        book_id: str,
         scene_id: str,
         turn: int,
         actor: str,
@@ -165,10 +223,11 @@ class MemoryStore:
             conn.execute(
                 """
                 INSERT INTO scene_turn_logs (
-                    scene_id, turn, actor, action_json, decision_json, state_delta, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    book_id, scene_id, turn, actor, action_json, decision_json, state_delta, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    book_id,
                     scene_id,
                     int(turn),
                     actor,
@@ -179,15 +238,15 @@ class MemoryStore:
                 ),
             )
 
-    def save_snapshot(self, scene_id: str, turn: int, state: dict[str, Any]) -> None:
+    def save_snapshot(self, *, book_id: str, scene_id: str, turn: int, state: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO scene_state_snapshots (scene_id, turn, state_json, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO scene_state_snapshots (book_id, scene_id, turn, state_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (scene_id, int(turn), json.dumps(state, ensure_ascii=False), now),
+                (book_id, scene_id, int(turn), json.dumps(state, ensure_ascii=False), now),
             )
 
 
@@ -249,6 +308,7 @@ class SceneOrchestrator:
                 agent_id=actor_id,
                 scene_id=scene_input.scene_id,
                 top_k=getattr(self._config.memory, "top_k", 5),
+                book_id=scene_input.book_id,
             )
 
             dynamic_scene = SceneInput(
@@ -256,6 +316,7 @@ class SceneOrchestrator:
                 title=scene_input.title,
                 objective=scene_input.objective,
                 participants=scene_input.participants,
+                book_id=scene_input.book_id,
                 context=scene_input.context,
                 state=copy.deepcopy(state),
                 recent_events=history_events[-8:],
@@ -278,6 +339,7 @@ class SceneOrchestrator:
             )
 
             turn_log = TurnLog(
+                book_id=scene_input.book_id,
                 scene_id=scene_input.scene_id,
                 turn=turn,
                 actor=actor_id,
@@ -288,8 +350,8 @@ class SceneOrchestrator:
             )
             logs.append(turn_log)
 
-            self._persist_turn(scene_input.scene_id, turn_log)
-            self._persist_memories(scene_input.scene_id, turn_log, agents)
+            self._persist_turn(scene_input.book_id, scene_input.scene_id, turn_log)
+            self._persist_memories(scene_input.book_id, scene_input.scene_id, turn_log, agents)
 
             history_events.append(
                 f"Turn {turn} {actor_id}: {decision.resolved_action.action} / {decision.resolved_action.speech}"
@@ -303,6 +365,7 @@ class SceneOrchestrator:
 
             if _is_objective_achieved(state):
                 return SceneResult(
+                    book_id=scene_input.book_id,
                     scene_id=scene_input.scene_id,
                     status="objective_achieved",
                     turns=turn,
@@ -312,6 +375,7 @@ class SceneOrchestrator:
                 )
 
         return SceneResult(
+            book_id=scene_input.book_id,
             scene_id=scene_input.scene_id,
             status="max_turns_reached",
             turns=total_turns,
@@ -422,6 +486,7 @@ class SceneOrchestrator:
             response = self._llm_manager.chat_sync(
                 LLMRequest(
                     agent_id=director_cfg.agent_id,
+                    book_id=scene_input.book_id,
                     provider=director_cfg.provider,
                     model=director_cfg.model,
                     messages=messages,
@@ -457,7 +522,7 @@ class SceneOrchestrator:
             rationale="Director fallback: invalid model output",
         )
 
-    def _persist_turn(self, scene_id: str, turn_log: TurnLog) -> None:
+    def _persist_turn(self, book_id: str, scene_id: str, turn_log: TurnLog) -> None:
         action_payload = asdict(turn_log.action)
         decision_payload = {
             "accepted": turn_log.decision.accepted,
@@ -467,6 +532,7 @@ class SceneOrchestrator:
             "rationale": turn_log.decision.rationale,
         }
         self._memory_store.append_turn_log(
+            book_id=book_id,
             scene_id=scene_id,
             turn=turn_log.turn,
             actor=turn_log.actor,
@@ -474,10 +540,16 @@ class SceneOrchestrator:
             decision_payload=decision_payload,
             state_delta=turn_log.decision.state_delta,
         )
-        self._memory_store.save_snapshot(scene_id, turn_log.turn, turn_log.state_after)
+        self._memory_store.save_snapshot(
+            book_id=book_id,
+            scene_id=scene_id,
+            turn=turn_log.turn,
+            state=turn_log.state_after,
+        )
 
     def _persist_memories(
         self,
+        book_id: str,
         scene_id: str,
         turn_log: TurnLog,
         agents: dict[str, ActionAgent],
@@ -493,6 +565,7 @@ class SceneOrchestrator:
                 scene_id=scene_id,
                 turn=turn_log.turn,
                 content=content,
+                book_id=book_id,
                 importance=0.8 if turn_log.decision.accepted else 0.5,
                 tags=["self-action", "scene-turn"],
             )
@@ -506,6 +579,7 @@ class SceneOrchestrator:
                     scene_id=scene_id,
                     turn=turn_log.turn,
                     content=f"{action.agent_id} 对你采取了行动: {action.action}; 台词: {action.speech}",
+                    book_id=book_id,
                     importance=0.7,
                     tags=["targeted-event"],
                 )

@@ -236,3 +236,70 @@ def test_chat_async_sync_consistency(tmp_path: Path) -> None:
         assert async_response.usage.total_tokens == sync_response.usage.total_tokens
     finally:
         manager.close_sync()
+
+
+@pytest.mark.asyncio
+async def test_usage_query_can_filter_by_book_id(tmp_path: Path) -> None:
+    urls, runtime = _write_configs(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        model = body["model"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": f"ok-{model}"}}],
+                "usage": {
+                    "prompt_tokens": 6,
+                    "completion_tokens": 2,
+                    "total_tokens": 8,
+                },
+            },
+        )
+
+    manager = LLMClientManager.from_yaml(
+        str(urls),
+        str(runtime),
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        await manager.chat(
+            LLMRequest(
+                book_id="book_a",
+                agent_id="narrator",
+                messages=[{"role": "user", "content": "a"}],
+            )
+        )
+        await manager.chat(
+            LLMRequest(
+                book_id="book_b",
+                agent_id="narrator",
+                messages=[{"role": "user", "content": "b"}],
+            )
+        )
+
+        start = datetime.now(timezone.utc) - timedelta(minutes=5)
+        end = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        rows_a = manager.usage_reporter.query(
+            start,
+            end,
+            book_id="book_a",
+            group_by=("book", "agent", "provider", "model"),
+        )
+        rows_b = manager.usage_reporter.query(
+            start,
+            end,
+            book_id="book_b",
+            group_by=("book", "agent", "provider", "model"),
+        )
+
+        assert len(rows_a) == 1
+        assert rows_a[0]["book_id"] == "book_a"
+        assert rows_a[0]["requests"] == 1
+        assert len(rows_b) == 1
+        assert rows_b[0]["book_id"] == "book_b"
+        assert rows_b[0]["requests"] == 1
+    finally:
+        await manager.aclose()

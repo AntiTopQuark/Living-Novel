@@ -22,25 +22,54 @@ async function request(path, options = {}) {
   return payload
 }
 
+function withQuery(path, params = {}) {
+  const search = new URLSearchParams()
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') return
+    search.set(key, String(value))
+  })
+  const suffix = search.toString() ? `?${search.toString()}` : ''
+  return `${path}${suffix}`
+}
+
 export const dashboardApi = {
-  getKpis() {
-    return request('/api/dashboard/kpis')
+  getBooks() {
+    return request('/api/books')
   },
-  getScenes() {
-    return request('/api/dashboard/scenes')
+  createBook(payload) {
+    return request('/api/books', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
   },
-  getSceneTurns(sceneId) {
-    return request(`/api/dashboard/scenes/${encodeURIComponent(sceneId)}/turns`)
+  activateBook(bookId) {
+    return request(`/api/books/${encodeURIComponent(bookId)}/activate`, {
+      method: 'POST',
+    })
   },
-  getAgents() {
-    return request('/api/dashboard/agents')
+  getKpis(bookId) {
+    return request(withQuery('/api/dashboard/kpis', { book_id: bookId }))
+  },
+  getScenes(bookId) {
+    return request(withQuery('/api/dashboard/scenes', { book_id: bookId }))
+  },
+  getSceneTurns(sceneId, bookId) {
+    return request(
+      withQuery(`/api/dashboard/scenes/${encodeURIComponent(sceneId)}/turns`, { book_id: bookId }),
+    )
+  },
+  getAgents(bookId) {
+    return request(withQuery('/api/dashboard/agents', { book_id: bookId }))
   },
   getCosts(params = {}) {
-    const search = new URLSearchParams()
-    if (params.from) search.set('from', params.from)
-    if (params.to) search.set('to', params.to)
-    const suffix = search.toString() ? `?${search.toString()}` : ''
-    return request(`/api/dashboard/costs${suffix}`)
+    return request(
+      withQuery('/api/dashboard/costs', {
+        book_id: params.book_id,
+        scope: params.scope,
+        from: params.from,
+        to: params.to,
+      }),
+    )
   },
   startScene(payload) {
     return request('/api/control/scenes/start', {
@@ -48,16 +77,16 @@ export const dashboardApi = {
       body: JSON.stringify(payload),
     })
   },
-  pauseScene(sceneId, message = '') {
+  pauseScene(sceneId, bookId, message = '') {
     return request(`/api/control/scenes/${encodeURIComponent(sceneId)}/pause`, {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ book_id: bookId, message }),
     })
   },
-  resumeScene(sceneId, message = '') {
+  resumeScene(sceneId, bookId, message = '') {
     return request(`/api/control/scenes/${encodeURIComponent(sceneId)}/resume`, {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ book_id: bookId, message }),
     })
   },
 }

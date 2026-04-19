@@ -143,6 +143,7 @@ class SceneInput:
     title: str
     objective: str
     participants: list[str]
+    book_id: str = "default_book"
     context: str = ""
     state: dict[str, Any] = field(default_factory=dict)
     recent_events: list[str] = field(default_factory=list)
@@ -157,6 +158,7 @@ class MemoryEvent:
     scene_id: str
     turn: int
     content: str
+    book_id: str = "default_book"
     importance: float = 0.5
     tags: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -266,6 +268,7 @@ class DirectorDecision:
 
 @dataclass(slots=True)
 class TurnLog:
+    book_id: str
     scene_id: str
     turn: int
     actor: str
@@ -278,6 +281,7 @@ class TurnLog:
 
 @dataclass(slots=True)
 class SceneResult:
+    book_id: str
     scene_id: str
     status: str
     turns: int

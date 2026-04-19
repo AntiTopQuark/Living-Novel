@@ -89,6 +89,7 @@ print(result.status, result.turns, result.final_state)
 ## Progress Dashboard (React + FastAPI)
 
 新增进度看板，支持展示“流程总览 / 场景进度 / 角色进度”，并可执行场景开始、暂停、继续。
+当前已升级为多书籍并行（book-aware）：同库多书隔离、按书切换、按书并行运行。
 
 ### Backend API
 
@@ -96,14 +97,17 @@ print(result.status, result.turns, result.final_state)
 - 路由前缀：`/api/*`
 
 接口：
-- `GET /api/dashboard/kpis`
-- `GET /api/dashboard/scenes`
-- `GET /api/dashboard/scenes/{scene_id}/turns`
-- `GET /api/dashboard/agents`
-- `GET /api/dashboard/costs?from=&to=`
-- `POST /api/control/scenes/start`
-- `POST /api/control/scenes/{scene_id}/pause`
-- `POST /api/control/scenes/{scene_id}/resume`
+- `GET /api/books`
+- `POST /api/books`
+- `POST /api/books/{book_id}/activate`
+- `GET /api/dashboard/kpis?book_id=...`
+- `GET /api/dashboard/scenes?book_id=...`
+- `GET /api/dashboard/scenes/{scene_id}/turns?book_id=...`
+- `GET /api/dashboard/agents?book_id=...`
+- `GET /api/dashboard/costs?book_id=...&scope=current|global&from=&to=`
+- `POST /api/control/scenes/start`（请求体必须带 `book_id`）
+- `POST /api/control/scenes/{scene_id}/pause`（请求体必须带 `book_id`）
+- `POST /api/control/scenes/{scene_id}/resume`（请求体必须带 `book_id`）
 
 开发启动：
 ```bash
@@ -121,6 +125,8 @@ print(result.status, result.turns, result.final_state)
 - 技术：React + Vite
 - 数据更新：5 秒轮询
 - 时间显示：浏览器本地时区
+- 路由：`/books/:bookId/overview|scenes|agents`
+- 顶部支持书籍切换、快速创建、当前书与全局成本视图切换
 
 开发启动：
 ```bash

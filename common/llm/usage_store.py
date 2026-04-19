@@ -30,6 +30,7 @@ class UsageStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     request_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    book_id TEXT NOT NULL DEFAULT 'default_book',
                     agent_id TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     model TEXT NOT NULL,
@@ -47,12 +48,39 @@ class UsageStore:
                 )
                 """
             )
+            self._ensure_column(
+                conn,
+                "usage_events",
+                "book_id",
+                "TEXT NOT NULL DEFAULT 'default_book'",
+            )
+            conn.execute(
+                "UPDATE usage_events SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage_events(created_at)"
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_usage_group ON usage_events(agent_id, provider, model)"
+                "CREATE INDEX IF NOT EXISTS idx_usage_group ON usage_events(book_id, agent_id, provider, model)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_book_created_at ON usage_events(book_id, created_at)"
+            )
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_def: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name in columns:
+            return
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
 
     def insert(self, record: UsageRecord) -> None:
         payload = asdict(record)
@@ -63,13 +91,13 @@ class UsageStore:
             conn.execute(
                 """
                 INSERT INTO usage_events (
-                    request_id, created_at, agent_id, provider, model, endpoint_id,
+                    request_id, created_at, book_id, agent_id, provider, model, endpoint_id,
                     prompt_tokens, completion_tokens, total_tokens,
                     input_cost, output_cost, total_cost,
                     latency_ms, estimated, status, error
                 )
                 VALUES (
-                    :request_id, :created_at, :agent_id, :provider, :model, :endpoint_id,
+                    :request_id, :created_at, :book_id, :agent_id, :provider, :model, :endpoint_id,
                     :prompt_tokens, :completion_tokens, :total_tokens,
                     :input_cost, :output_cost, :total_cost,
                     :latency_ms, :estimated, :status, :error
@@ -83,6 +111,7 @@ class UsageStore:
         *,
         start: datetime,
         end: datetime,
+        book_id: str | None = None,
         agent_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
@@ -91,6 +120,8 @@ class UsageStore:
         alias_to_column = {
             "agent": "agent_id",
             "agent_id": "agent_id",
+            "book": "book_id",
+            "book_id": "book_id",
             "provider": "provider",
             "model": "model",
             "endpoint": "endpoint_id",
@@ -115,6 +146,9 @@ class UsageStore:
             "end": end.astimezone(timezone.utc).isoformat(),
         }
 
+        if book_id:
+            where_parts.append("book_id = :book_id")
+            params["book_id"] = book_id
         if agent_id:
             where_parts.append("agent_id = :agent_id")
             params["agent_id"] = agent_id

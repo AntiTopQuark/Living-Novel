@@ -11,6 +11,7 @@ ChatMessage = dict[str, Any]
 @dataclass(slots=True)
 class LLMRequest:
     messages: list[ChatMessage]
+    book_id: str = "default_book"
     provider: str | None = None
     model: str | None = None
     agent_id: str = "default"
@@ -24,6 +25,7 @@ class LLMRequest:
 @dataclass(slots=True)
 class UsageRecord:
     request_id: str
+    book_id: str
     agent_id: str
     provider: str
     model: str

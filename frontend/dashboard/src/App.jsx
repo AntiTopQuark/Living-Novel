@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
 
 import { dashboardApi } from './api'
 import CostTrendChart from './components/CostTrendChart'
@@ -35,22 +36,95 @@ function formatLocalTime(value) {
   return date.toLocaleString()
 }
 
-export default function App() {
-  const [tab, setTab] = useState('overview')
+function parseRoute(pathname) {
+  const match = pathname.match(/^\/books\/([^/]+)\/(overview|scenes|agents)$/)
+  if (!match) return null
+  return {
+    bookId: decodeURIComponent(match[1]),
+    tab: match[2],
+  }
+}
+
+function buildBookRoute(bookId, tab) {
+  const safeBook = encodeURIComponent(bookId)
+  const safeTab = TABS.some((item) => item.id === tab) ? tab : 'overview'
+  return `/books/${safeBook}/${safeTab}`
+}
+
+function DashboardApp() {
+  const navigate = useNavigate()
+  const location = useLocation()
+
+  const route = parseRoute(location.pathname)
+  const routeBookId = route?.bookId ?? null
+  const tab = route?.tab ?? 'overview'
+
   const [selectedSceneId, setSelectedSceneId] = useState('')
   const [sceneFilter, setSceneFilter] = useState('')
   const [startForm, setStartForm] = useState(initialStartForm)
   const [controlMessage, setControlMessage] = useState('')
   const [notice, setNotice] = useState('')
   const [controlBusy, setControlBusy] = useState(false)
+  const [newBookId, setNewBookId] = useState('')
+  const [newBookTitle, setNewBookTitle] = useState('')
+  const [costScope, setCostScope] = useState('current')
 
-  const kpisQuery = usePollingQuery(() => dashboardApi.getKpis(), [], 5000)
-  const scenesQuery = usePollingQuery(() => dashboardApi.getScenes(), [], 5000)
-  const agentsQuery = usePollingQuery(() => dashboardApi.getAgents(), [], 5000)
-  const costsQuery = usePollingQuery(() => dashboardApi.getCosts(), [], 5000)
+  const booksQuery = usePollingQuery(() => dashboardApi.getBooks(), [], 5000)
+  const books = booksQuery.data?.items ?? []
+  const knownBookIds = useMemo(() => new Set(books.map((item) => item.book_id)), [books])
+
+  const firstBookId = books[0]?.book_id || 'default_book'
+  const currentBookId = routeBookId || firstBookId
+
+  useEffect(() => {
+    if (!routeBookId) {
+      navigate(buildBookRoute(firstBookId, 'overview'), { replace: true })
+      return
+    }
+
+    if (!TABS.some((item) => item.id === tab)) {
+      navigate(buildBookRoute(routeBookId, 'overview'), { replace: true })
+    }
+  }, [routeBookId, tab, firstBookId, navigate])
+
+  useEffect(() => {
+    if (!routeBookId || books.length === 0) return
+    if (knownBookIds.has(routeBookId)) return
+    navigate(buildBookRoute(firstBookId, tab), { replace: true })
+  }, [routeBookId, books.length, knownBookIds, firstBookId, tab, navigate])
+
+  useEffect(() => {
+    setSelectedSceneId('')
+    setSceneFilter('')
+    setControlMessage('')
+    setNotice('')
+  }, [currentBookId])
+
+  const kpisQuery = usePollingQuery(
+    currentBookId ? () => dashboardApi.getKpis(currentBookId) : null,
+    [currentBookId],
+    5000,
+  )
+  const scenesQuery = usePollingQuery(
+    currentBookId ? () => dashboardApi.getScenes(currentBookId) : null,
+    [currentBookId],
+    5000,
+  )
+  const agentsQuery = usePollingQuery(
+    currentBookId ? () => dashboardApi.getAgents(currentBookId) : null,
+    [currentBookId],
+    5000,
+  )
+  const costsQuery = usePollingQuery(
+    currentBookId ? () => dashboardApi.getCosts({ book_id: currentBookId, scope: costScope }) : null,
+    [currentBookId, costScope],
+    5000,
+  )
   const turnsQuery = usePollingQuery(
-    selectedSceneId ? () => dashboardApi.getSceneTurns(selectedSceneId) : null,
-    [selectedSceneId],
+    selectedSceneId && currentBookId
+      ? () => dashboardApi.getSceneTurns(selectedSceneId, currentBookId)
+      : null,
+    [selectedSceneId, currentBookId],
     5000,
   )
 
@@ -77,31 +151,76 @@ export default function App() {
   }, [selectedSceneId, scenes])
 
   useEffect(() => {
-    if (selectedSceneId) return
-    if (!startForm.scene_id && scenes.length > 0) {
-      const seed = scenes[0]
-      setStartForm((prev) => ({
-        ...prev,
-        scene_id: seed.scene_id || prev.scene_id,
-        title: seed.scene_id || prev.title,
-      }))
-    }
-  }, [selectedSceneId, startForm.scene_id, scenes])
+    if (startForm.scene_id || scenes.length === 0) return
+    const seed = scenes[0]
+    setStartForm((prev) => ({
+      ...prev,
+      scene_id: seed.scene_id || prev.scene_id,
+      title: seed.scene_id || prev.title,
+    }))
+  }, [startForm.scene_id, scenes])
 
   const anyLoading =
-    kpisQuery.loading || scenesQuery.loading || agentsQuery.loading || costsQuery.loading
+    booksQuery.loading ||
+    kpisQuery.loading ||
+    scenesQuery.loading ||
+    agentsQuery.loading ||
+    costsQuery.loading
 
   const anyError =
-    kpisQuery.error || scenesQuery.error || agentsQuery.error || costsQuery.error || turnsQuery.error
+    booksQuery.error ||
+    kpisQuery.error ||
+    scenesQuery.error ||
+    agentsQuery.error ||
+    costsQuery.error ||
+    turnsQuery.error
 
   async function refreshAll() {
     await Promise.all([
+      booksQuery.refresh(),
       kpisQuery.refresh(),
       scenesQuery.refresh(),
       agentsQuery.refresh(),
       costsQuery.refresh(),
       turnsQuery.refresh(),
     ])
+  }
+
+  async function switchBook(nextBookId) {
+    if (!nextBookId) return
+    try {
+      await dashboardApi.activateBook(nextBookId)
+    } catch {
+      // ignore activation error, UI navigation still works for direct data view
+    }
+    navigate(buildBookRoute(nextBookId, tab))
+    await refreshAll()
+  }
+
+  async function handleCreateBook(event) {
+    event.preventDefault()
+    const bookId = newBookId.trim()
+    const title = newBookTitle.trim() || bookId
+    if (!bookId) {
+      setNotice('book_id 不能为空')
+      return
+    }
+
+    setControlBusy(true)
+    setNotice('')
+    try {
+      await dashboardApi.createBook({ book_id: bookId, title })
+      await dashboardApi.activateBook(bookId)
+      setNewBookId('')
+      setNewBookTitle('')
+      setNotice(`书籍 ${bookId} 已创建并激活`)
+      navigate(buildBookRoute(bookId, tab))
+      await refreshAll()
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setControlBusy(false)
+    }
   }
 
   async function handleStart(event) {
@@ -127,6 +246,7 @@ export default function App() {
       }
 
       const response = await dashboardApi.startScene({
+        book_id: currentBookId,
         scene_id: startForm.scene_id.trim(),
         title: startForm.title.trim(),
         objective: startForm.objective.trim(),
@@ -136,7 +256,9 @@ export default function App() {
         max_turns: Number(startForm.max_turns) || undefined,
       })
 
-      setNotice(`场景 ${response.scene_id} 已执行，状态 ${response.status}，回合 ${response.turns}`)
+      setNotice(
+        `书籍 ${response.book_id} 场景 ${response.scene_id} 已执行，状态 ${response.status}，回合 ${response.turns}`,
+      )
       setSelectedSceneId(response.scene_id)
       await refreshAll()
     } catch (error) {
@@ -154,8 +276,8 @@ export default function App() {
     setControlBusy(true)
     setNotice('')
     try {
-      const result = await dashboardApi.pauseScene(selectedSceneId, controlMessage)
-      setNotice(`场景 ${result.scene_id} 已暂停`)
+      const result = await dashboardApi.pauseScene(selectedSceneId, currentBookId, controlMessage)
+      setNotice(`书籍 ${result.book_id} 场景 ${result.scene_id} 已暂停`)
       await refreshAll()
     } catch (error) {
       setNotice(error.message)
@@ -172,8 +294,8 @@ export default function App() {
     setControlBusy(true)
     setNotice('')
     try {
-      const result = await dashboardApi.resumeScene(selectedSceneId, controlMessage)
-      setNotice(`场景 ${result.scene_id} 已恢复到可执行状态`)
+      const result = await dashboardApi.resumeScene(selectedSceneId, currentBookId, controlMessage)
+      setNotice(`书籍 ${result.book_id} 场景 ${result.scene_id} 已恢复到可执行状态`)
       await refreshAll()
     } catch (error) {
       setNotice(error.message)
@@ -201,9 +323,48 @@ export default function App() {
           <p className="eyebrow">Living Novel</p>
           <h1>整理流程与进度看板</h1>
         </div>
-        <div className="sync-state">
-          <span className={anyLoading ? 'pulse-dot' : 'pulse-dot steady'} />
-          <span>{anyLoading ? '数据同步中...' : '实时轮询每 5 秒'}</span>
+        <div className="topbar-side">
+          <div className="book-switcher">
+            <label htmlFor="book-switcher">当前书籍</label>
+            <select
+              id="book-switcher"
+              className="text-input"
+              value={currentBookId}
+              onChange={(event) => {
+                void switchBook(event.target.value)
+              }}
+            >
+              {books.length === 0 ? <option value={currentBookId}>{currentBookId}</option> : null}
+              {books.map((book) => (
+                <option key={book.book_id} value={book.book_id}>
+                  {book.title} ({book.book_id}) [{book.status}]
+                </option>
+              ))}
+            </select>
+          </div>
+          <form className="book-create" onSubmit={handleCreateBook}>
+            <input
+              className="text-input"
+              value={newBookId}
+              onChange={(event) => setNewBookId(event.target.value)}
+              placeholder="新 book_id"
+              aria-label="新书 book_id"
+            />
+            <input
+              className="text-input"
+              value={newBookTitle}
+              onChange={(event) => setNewBookTitle(event.target.value)}
+              placeholder="新书标题"
+              aria-label="新书标题"
+            />
+            <button type="submit" className="btn primary" disabled={controlBusy}>
+              创建并切换
+            </button>
+          </form>
+          <div className="sync-state">
+            <span className={anyLoading ? 'pulse-dot' : 'pulse-dot steady'} />
+            <span>{anyLoading ? '数据同步中...' : '实时轮询每 5 秒'}</span>
+          </div>
         </div>
       </header>
 
@@ -213,7 +374,7 @@ export default function App() {
             key={item.id}
             type="button"
             className={tab === item.id ? 'tab active' : 'tab'}
-            onClick={() => setTab(item.id)}
+            onClick={() => navigate(buildBookRoute(currentBookId, item.id))}
           >
             {item.label}
           </button>
@@ -226,7 +387,11 @@ export default function App() {
       {tab === 'overview' ? (
         <section className="panel-grid">
           <div className="kpi-grid">
-            <KpiCard title="场景完成率" value={formatPct(kpis.completion_rate)} hint={`${kpis.completed_scenes}/${kpis.total_scenes}`} />
+            <KpiCard
+              title="场景完成率"
+              value={formatPct(kpis.completion_rate)}
+              hint={`${kpis.completed_scenes}/${kpis.total_scenes}`}
+            />
             <KpiCard title="总回合数" value={kpis.total_turns} hint="累计 scene_turn_logs" />
             <KpiCard title="活跃角色" value={kpis.active_agents} hint="最近有行动的角色" />
             <KpiCard title="累计成本" value={`$${formatMoney(kpis.total_cost)}`} hint="usage_events 总成本" />
@@ -235,7 +400,7 @@ export default function App() {
           <article className="card span-two">
             <header className="card-head">
               <h2>最近场景进度</h2>
-              <span className="muted">按最近更新时间排序</span>
+              <span className="muted">book_id: {currentBookId}</span>
             </header>
             {scenes.length === 0 ? (
               <p className="muted">暂无场景数据，先在“场景进度”页启动一次场景。</p>
@@ -253,7 +418,7 @@ export default function App() {
                 </thead>
                 <tbody>
                   {scenes.slice(0, 8).map((item) => (
-                    <tr key={item.scene_id}>
+                    <tr key={`${item.book_id}-${item.scene_id}`}>
                       <td>{item.scene_id}</td>
                       <td>
                         <StatusPill status={item.status} />
@@ -272,8 +437,24 @@ export default function App() {
           <article className="card span-two">
             <header className="card-head">
               <h2>Token 成本趋势</h2>
-              <span className="muted">按天聚合</span>
+              <div className="cost-scope-toggle">
+                <button
+                  type="button"
+                  className={costScope === 'current' ? 'tab active' : 'tab'}
+                  onClick={() => setCostScope('current')}
+                >
+                  当前书籍
+                </button>
+                <button
+                  type="button"
+                  className={costScope === 'global' ? 'tab active' : 'tab'}
+                  onClick={() => setCostScope('global')}
+                >
+                  全局
+                </button>
+              </div>
             </header>
+            <p className="muted">当前视图: {costScope === 'current' ? `book_id=${currentBookId}` : 'global'}</p>
             <CostTrendChart series={costs.series} />
             <div className="cost-agent-grid">
               {(costs.by_agent || []).length === 0 ? (
@@ -298,7 +479,7 @@ export default function App() {
           <article className="card scene-list">
             <header className="card-head">
               <h2>场景列表</h2>
-              <span className="muted">筛选 scene_id / 状态 / 角色</span>
+              <span className="muted">book_id: {currentBookId}</span>
             </header>
             <input
               value={sceneFilter}
@@ -312,7 +493,7 @@ export default function App() {
             ) : (
               <ul className="scene-items">
                 {filteredScenes.map((item) => (
-                  <li key={item.scene_id}>
+                  <li key={`${item.book_id}-${item.scene_id}`}>
                     <button
                       type="button"
                       className={selectedSceneId === item.scene_id ? 'scene-btn active' : 'scene-btn'}
@@ -374,7 +555,7 @@ export default function App() {
           <article className="card scene-controls">
             <header className="card-head">
               <h2>流程控制</h2>
-              <span className="muted">开始 / 暂停 / 继续</span>
+              <span className="muted">book_id: {currentBookId}</span>
             </header>
 
             <form className="start-form" onSubmit={handleStart}>
@@ -487,7 +668,7 @@ export default function App() {
           <article className="card span-two">
             <header className="card-head">
               <h2>角色推进状态</h2>
-              <span className="muted">按活跃回合数排序</span>
+              <span className="muted">book_id: {currentBookId}</span>
             </header>
             {agents.length === 0 ? (
               <p className="muted">暂无角色进度数据。</p>
@@ -522,6 +703,14 @@ export default function App() {
         </section>
       ) : null}
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <DashboardApp />
+    </BrowserRouter>
   )
 }
 
