@@ -1,0 +1,19 @@
+sqlite_path: "data/llm_usage.db"
+enable_streaming: true
+
+defaults:
+  provider: "openai_compat"
+  model: "gpt-4o-mini"
+
+agent_routes:
+  narrator:
+    provider: "openai_compat"
+    model: "gpt-4o-mini"
+  character_memory:
+    provider: "openai_compat"
+    model: "gpt-4.1-mini"
+
+pricing:
+  openai_compat:
+    input_per_1k_tokens: 0.001
+    output_per_1k_tokens: 0.002

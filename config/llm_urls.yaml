@@ -1,0 +1,18 @@
+providers:
+  openai_compat:
+    api_key: "YOUR_API_KEY"
+    timeout_seconds: 30
+    max_retries: 2
+    retry_backoff_seconds: 0.5
+    circuit_breaker:
+      failure_threshold: 3
+      recovery_seconds: 20
+    base_urls:
+      - id: "primary"
+        url: "https://api.openai.com"
+        weight: 3
+      - id: "backup"
+        url: "https://api.openai-proxy.example.com"
+        weight: 1
+    headers:
+      X-Project: "Living-Novel"

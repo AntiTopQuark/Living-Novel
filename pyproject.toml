@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "living-novel"
+version = "0.1.0"
+description = "Common LLM module for multi-agent interactions"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx>=0.27.0",
+  "PyYAML>=6.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
