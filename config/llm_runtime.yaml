@@ -12,6 +12,12 @@ agent_routes:
   character_memory:
     provider: "openai_compat"
     model: "gpt-4.1-mini"
+  protagonist:
+    provider: "openai_compat"
+    model: "gpt-4.1-mini"
+  director:
+    provider: "openai_compat"
+    model: "gpt-4o-mini"
 
 pricing:
   openai_compat:

@@ -17,6 +17,7 @@
 ### Config
 - URL 与路由配置：`config/llm_urls.yaml`
 - 运行与计费配置：`config/llm_runtime.yaml`
+- Agent 工厂配置：`config/agent_factory.yaml`
 
 ### Quick Start
 ```python
@@ -37,4 +38,50 @@ response = manager.chat_sync(
     )
 )
 print(response.text)
+```
+
+## OpenClaw 风格 Agent Factory
+
+新增模块：`common.agents`，支持“每个角色一个 Skill 文件，每个角色一个 Agent”。
+
+### Skill 目录
+- 角色 Skill：`skills/characters/*.md`
+- 模板目录：`skills/templates/`
+
+### 关键能力
+- 固定 Markdown 标题模板解析与校验（必填 6 段）
+- `AgentFactory` 批量创建角色 Agent
+- `SceneOrchestrator` 高级编排：
+  - 场景优先级 + 动态插队调度
+  - Director Agent 冲突裁决
+  - 目标达成或回合上限停止
+- SQLite 持久化：
+  - `agent_memory_events`
+  - `scene_turn_logs`
+  - `scene_state_snapshots`
+
+### Quick Start
+```python
+from common.agents import AgentFactory, SceneInput
+
+factory = AgentFactory.from_yaml(
+    "config/llm_urls.yaml",
+    "config/llm_runtime.yaml",
+    "config/agent_factory.yaml",
+)
+
+agents = factory.create_agents_from_dir("skills/characters")
+orchestrator = factory.create_orchestrator()
+
+scene = SceneInput(
+    scene_id="ep01_scene01",
+    title="码头对峙",
+    objective="主角确认账本是否为真并避免暴露线人",
+    participants=["protagonist"],
+    context="深夜仓库，局势紧绷。",
+    state={"objective_achieved": False, "unresolved_conflicts": []},
+)
+
+result = orchestrator.run_scene(scene, agents, max_turns=6)
+print(result.status, result.turns, result.final_state)
 ```
