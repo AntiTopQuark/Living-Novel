@@ -350,7 +350,7 @@ describe('Dashboard App', () => {
     })
 
     fireEvent.change(screen.getByLabelText('目标'), { target: { value: '推进剧情' } })
-    fireEvent.change(screen.getByLabelText('参与角色（逗号分隔）'), {
+    fireEvent.change(screen.getByLabelText(/参与角色（逗号分隔）/), {
       target: { value: 'hero' },
     })
     fireEvent.click(screen.getByRole('button', { name: '异步开始执行' }))

@@ -155,6 +155,7 @@ npm run dev
 - 新建书籍时必须填写 8 项信息：`background/worldview/era_setting/genre/protagonist/protagonist_goal/core_conflict/narrative_style`
 - 支持在 Overview 页编辑当前书籍设定
 - `start` 与 `start_async` 会自动将书籍设定注入场景上下文（若旧书未补全设定则跳过注入，不阻断运行）
+- 场景 `participants` 支持填写 `agent_id`、角色“姓名”或“称呼”，后端会自动映射为对应 agent
 
 默认访问地址：
 - 前端：`http://127.0.0.1:5173`

@@ -89,6 +89,22 @@ function formatCountdown(seconds) {
   return `${mins}m ${secs}s`
 }
 
+function formatAutoRolesSummary(autoRoles) {
+  if (!autoRoles) return ''
+  const createdCount = Array.isArray(autoRoles.created) ? autoRoles.created.length : 0
+  const skippedCount = Array.isArray(autoRoles.skipped) ? autoRoles.skipped.length : 0
+  const failedCount = Array.isArray(autoRoles.failed) ? autoRoles.failed.length : 0
+  const trigger = autoRoles.trigger ? String(autoRoles.trigger) : 'unknown'
+  const names = (autoRoles.created || [])
+    .map((item) => item?.name || item?.agent_id)
+    .filter(Boolean)
+    .slice(0, 4)
+
+  const base = `自动增角(${trigger}) 新增${createdCount} 跳过${skippedCount} 失败${failedCount}`
+  if (names.length === 0) return base
+  return `${base}；新增角色: ${names.join('、')}`
+}
+
 function DashboardApp() {
   const navigate = useNavigate()
   const location = useLocation()
@@ -352,18 +368,20 @@ function DashboardApp() {
         if (!bookId) {
           throw new Error('book_id 不能为空')
         }
-        await dashboardApi.createBook({
+        const created = await dashboardApi.createBook({
           book_id: bookId,
           title,
           profile: profilePayload,
         })
         await dashboardApi.activateBook(bookId)
-        setNotice(`书籍 ${bookId} 已创建并切换`)
+        const autoRolesSummary = formatAutoRolesSummary(created.auto_roles)
+        setNotice(`书籍 ${bookId} 已创建并切换${autoRolesSummary ? `；${autoRolesSummary}` : ''}`)
         setWizardOpen(false)
         navigate(buildBookRoute(bookId, tab))
       } else {
-        await dashboardApi.patchBookProfile(currentBookId, profilePayload)
-        setNotice(`书籍 ${currentBookId} 设定已更新`)
+        const updated = await dashboardApi.patchBookProfile(currentBookId, profilePayload)
+        const autoRolesSummary = formatAutoRolesSummary(updated.auto_roles)
+        setNotice(`书籍 ${currentBookId} 设定已更新${autoRolesSummary ? `；${autoRolesSummary}` : ''}`)
         setWizardOpen(false)
       }
       await refreshAll()
@@ -449,7 +467,9 @@ function DashboardApp() {
       })
 
       setNotice(
-        `书籍 ${response.book_id} 场景 ${response.scene_id} 已异步启动，run_id=${response.run_id}`,
+        `书籍 ${response.book_id} 场景 ${response.scene_id} 已异步启动，run_id=${response.run_id}${
+          response.auto_roles ? `；${formatAutoRolesSummary(response.auto_roles)}` : ''
+        }`,
       )
       setSelectedSceneId(response.scene_id)
       await refreshAll()
@@ -924,9 +944,10 @@ function DashboardApp() {
                   onChange={(event) =>
                     setStartForm((prev) => ({ ...prev, participants: event.target.value }))
                   }
-                  placeholder="hero,villain"
+                  placeholder="可填 agent_id / 姓名 / 称呼，如: protagonist,林澈,阿澈"
                   required
                 />
+                <small className="muted">系统会基于世界观与场景自动补角，支持直接填写姓名或称呼。</small>
               </label>
               <label>
                 场景上下文
@@ -1030,6 +1051,15 @@ function DashboardApp() {
                     </p>
                     <p>
                       <b>记忆事件:</b> {item.memory_events}
+                    </p>
+                    <p>
+                      <b>年龄/等级:</b> {item.age ?? '-'} / {item.level ?? '-'}
+                    </p>
+                    <p>
+                      <b>物品/能力:</b> {item.inventory_count ?? 0} / {item.abilities_count ?? 0}
+                    </p>
+                    <p>
+                      <b>状态更新时间:</b> {formatLocalTime(item.last_state_update_at)}
                     </p>
                     <p>
                       <b>最近记忆:</b> {item.memory_last_content || '-'}

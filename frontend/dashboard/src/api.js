@@ -79,6 +79,11 @@ export const dashboardApi = {
   getAgents(bookId) {
     return request(withQuery('/api/dashboard/agents', { book_id: bookId }))
   },
+  getAgentState(agentId, bookId) {
+    return request(
+      withQuery(`/api/dashboard/agents/${encodeURIComponent(agentId)}/state`, { book_id: bookId }),
+    )
+  },
   getCosts(params = {}) {
     return request(
       withQuery('/api/dashboard/costs', {

@@ -10,7 +10,14 @@ from typing import Callable
 import httpx
 import pytest
 
-from common.agents import ActionValidationError, AgentFactory, SceneInput
+from common.agents import (
+    ActionValidationError,
+    AgentFactory,
+    CharacterRuntimeState,
+    CharacterStateUpdate,
+    MemoryStore,
+    SceneInput,
+)
 
 
 def _write_configs(tmp_path: Path, *, consecutive_penalty: float = 0.7) -> tuple[Path, Path, Path]:
@@ -505,3 +512,255 @@ def test_memory_persistence_usage_and_async_orchestration(tmp_path: Path) -> Non
         assert "director" in agent_ids
     finally:
         factory.close_sync()
+
+
+def test_director_state_update_applies_and_injects_into_next_prompt(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _write_configs(tmp_path)
+    _write_skill(tmp_path / "skills" / "hero.md", name="主角", urgency=0.9, tension=0.5)
+
+    hero_system_prompts: list[str] = []
+    director_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        model = payload["model"]
+        if model == "hero-model":
+            messages = payload.get("messages", [])
+            if isinstance(messages, list):
+                for item in messages:
+                    if isinstance(item, dict) and item.get("role") == "system":
+                        hero_system_prompts.append(str(item.get("content", "")))
+                        break
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "稳住局面",
+                        "speech": "先看清局势。",
+                        "action": "保持观察",
+                        "emotion": "平静",
+                        "target": None,
+                        "reason": "避免暴露信息",
+                        "goal_progress": "维持推进节奏",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if model == "director-model":
+            director_calls["count"] += 1
+            base_payload = {
+                "accepted": True,
+                "resolved_action": {
+                    "intent": "稳态推进",
+                    "speech": "继续观察。",
+                    "action": "轻微试探",
+                    "emotion": "克制",
+                    "target": None,
+                    "reason": "保持节奏",
+                    "goal_progress": "推进局势",
+                },
+                "state_delta": {"objective_achieved": True, "objective_status": "achieved"},
+                "conflict": None,
+                "rationale": "通过",
+                "confidence": 0.9,
+            }
+            if director_calls["count"] == 1:
+                base_payload["character_updates"] = [
+                    {
+                        "target": "hero",
+                        "confidence": 0.92,
+                        "reason": "剧情推进后角色获得新能力",
+                        "changes": {
+                            "level_set": 3,
+                            "inventory_add": ["黑曜石徽章"],
+                            "abilities_add": ["夜视"],
+                        },
+                    }
+                ]
+            return _chat_response(json.dumps(base_payload, ensure_ascii=False))
+        raise AssertionError(f"Unexpected model: {model}")
+
+    factory = AgentFactory.from_yaml(
+        str(urls),
+        str(runtime),
+        str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        agents = factory.create_agents_from_dir()
+        orchestrator = factory.create_orchestrator()
+
+        scene_one = SceneInput(
+            scene_id="scene-state-1",
+            title="状态演化-第一幕",
+            objective="触发角色状态更新",
+            participants=["hero"],
+            state={"objective_achieved": False},
+        )
+        result_one = orchestrator.run_scene(scene_one, agents, max_turns=1)
+        assert result_one.status == "objective_achieved"
+
+        runtime_state = factory.memory_store.get_runtime_state(book_id="default_book", agent_id="hero")
+        assert runtime_state.level == 3
+        assert runtime_state.inventory == ["黑曜石徽章"]
+        assert runtime_state.abilities == ["夜视"]
+
+        change_events = factory.memory_store.list_state_changes(
+            book_id="default_book",
+            agent_id="hero",
+            limit=10,
+        )
+        assert change_events
+        assert change_events[0]["applied_status"] == "applied_auto"
+
+        hero_memories = factory.memory_store.retrieve(
+            "hero",
+            "scene-state-1",
+            top_k=20,
+            book_id="default_book",
+        )
+        assert any("导演更新了你的状态" in event.content for event in hero_memories)
+
+        scene_two = SceneInput(
+            scene_id="scene-state-2",
+            title="状态演化-第二幕",
+            objective="验证状态注入",
+            participants=["hero"],
+            state={"objective_achieved": False},
+        )
+        result_two = orchestrator.run_scene(scene_two, agents, max_turns=1)
+        assert result_two.status == "objective_achieved"
+        assert hero_system_prompts
+        assert "等级=3" in hero_system_prompts[-1]
+        assert "黑曜石徽章" in hero_system_prompts[-1]
+    finally:
+        factory.close_sync()
+
+
+def test_director_low_confidence_state_update_is_skipped_in_sync(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _write_configs(tmp_path)
+    _write_skill(tmp_path / "skills" / "hero.md", name="主角", urgency=0.9, tension=0.5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        model = payload["model"]
+        if model == "hero-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "稳住局势",
+                        "speech": "继续观察。",
+                        "action": "不动声色",
+                        "emotion": "平静",
+                        "target": None,
+                        "reason": "等待更多信息",
+                        "goal_progress": "保持可控节奏",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if model == "director-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "resolved_action": {
+                            "intent": "稳态推进",
+                            "speech": "继续观察。",
+                            "action": "轻微施压",
+                            "emotion": "克制",
+                            "target": None,
+                            "reason": "维持推进",
+                            "goal_progress": "小步推进",
+                        },
+                        "state_delta": {"objective_achieved": True, "objective_status": "achieved"},
+                        "conflict": None,
+                        "rationale": "动作可行",
+                        "confidence": 0.95,
+                        "character_updates": [
+                            {
+                                "target": "hero",
+                                "confidence": 0.3,
+                                "reason": "证据不足的状态猜测",
+                                "changes": {"level_set": 9, "inventory_add": ["不存在的道具"]},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        raise AssertionError(f"Unexpected model: {model}")
+
+    factory = AgentFactory.from_yaml(
+        str(urls),
+        str(runtime),
+        str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        agents = factory.create_agents_from_dir()
+        orchestrator = factory.create_orchestrator()
+        scene = SceneInput(
+            scene_id="scene-low-confidence",
+            title="低置信度状态更新",
+            objective="验证同步路径跳过低置信度更新",
+            participants=["hero"],
+            state={"objective_achieved": False},
+        )
+        result = orchestrator.run_scene(scene, agents, max_turns=1)
+        assert result.status == "objective_achieved"
+
+        runtime_state = factory.memory_store.get_runtime_state(book_id="default_book", agent_id="hero")
+        assert runtime_state.level is None
+        assert runtime_state.inventory == []
+
+        change_events = factory.memory_store.list_state_changes(
+            book_id="default_book",
+            agent_id="hero",
+            limit=10,
+        )
+        assert change_events
+        assert change_events[0]["applied_status"] == "skipped_low_confidence"
+        assert change_events[0]["after_state"]["level"] is None
+    finally:
+        factory.close_sync()
+
+
+def test_invalid_numeric_state_update_keeps_existing_age_and_level(tmp_path: Path) -> None:
+    store = MemoryStore(str(tmp_path / "memory.db"))
+    initial_state = CharacterRuntimeState(
+        book_id="book-a",
+        agent_id="hero",
+        age=25,
+        level=5,
+    )
+    store.upsert_runtime_state(initial_state)
+
+    update = CharacterStateUpdate(
+        target="hero",
+        confidence=0.9,
+        reason="invalid numeric payload",
+        changes={
+            "age": "unknown-age",
+            "level_set": "NaN",
+            "level_delta": "also-invalid",
+            "inventory_add": ["记录器"],
+        },
+    )
+    event = store.apply_state_update(
+        book_id="book-a",
+        scene_id="scene-invalid-numeric",
+        turn=1,
+        update=update,
+        applied_status="applied_auto",
+        source="test",
+        apply=True,
+    )
+
+    state = store.get_runtime_state(book_id="book-a", agent_id="hero")
+    assert state.age == 25
+    assert state.level == 5
+    assert state.inventory == ["记录器"]
+    assert event["after_state"]["age"] == 25
+    assert event["after_state"]["level"] == 5

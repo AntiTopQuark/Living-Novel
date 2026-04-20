@@ -1,9 +1,19 @@
-from .factory import AgentFactory, AgentFactoryConfig, CharacterAgent, load_agent_factory_config
+from .factory import (
+    AgentFactory,
+    AgentFactoryConfig,
+    AutoCharacterConfig,
+    CharacterStateConfig,
+    CharacterAgent,
+    load_agent_factory_config,
+)
+from .auto_character import AutoCharacterService, AutoRoleGenerationResult, AutoRoleSpec
 from .orchestrator import MemoryStore, SceneOrchestrator
 from .schema import (
     ActionValidationError,
     AgentAction,
     CharacterSkill,
+    CharacterRuntimeState,
+    CharacterStateUpdate,
     DirectorDecision,
     MemoryEvent,
     SceneInput,
@@ -17,7 +27,14 @@ __all__ = [
     "AgentAction",
     "AgentFactory",
     "AgentFactoryConfig",
+    "AutoCharacterService",
+    "AutoCharacterConfig",
+    "AutoRoleGenerationResult",
+    "AutoRoleSpec",
     "CharacterAgent",
+    "CharacterStateConfig",
+    "CharacterRuntimeState",
+    "CharacterStateUpdate",
     "CharacterSkill",
     "DirectorDecision",
     "MemoryEvent",

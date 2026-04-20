@@ -54,7 +54,14 @@ def _write_skill(path: Path, *, name: str, urgency: float, tension: float) -> No
     )
 
 
-def _setup_files(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _setup_files(
+    tmp_path: Path,
+    *,
+    auto_character_enabled: bool = False,
+    trigger_on_profile_save: bool = False,
+    trigger_on_scene_start: bool = False,
+    book_skills_root: Path | None = None,
+) -> tuple[Path, Path, Path]:
     urls_path = tmp_path / "llm_urls.yaml"
     runtime_path = tmp_path / "llm_runtime.yaml"
     factory_path = tmp_path / "agent_factory.yaml"
@@ -104,6 +111,7 @@ pricing:
         encoding="utf-8",
     )
 
+    book_skills_dir = book_skills_root or (tmp_path / "book_skills")
     factory_path.write_text(
         f"""
 skills_dir: "{skills_dir.as_posix()}"
@@ -125,6 +133,18 @@ action:
   temperature: 0.6
   max_tokens: 500
   max_retries: 1
+auto_character:
+  enabled: {"true" if auto_character_enabled else "false"}
+  trigger_on_profile_save: {"true" if trigger_on_profile_save else "false"}
+  trigger_on_scene_start: {"true" if trigger_on_scene_start else "false"}
+  book_skills_root: "{book_skills_dir.as_posix()}"
+  overwrite_existing: false
+  max_new_roles_per_run:
+  provider: p1
+  model: auto-role-model
+  temperature: 0.1
+  max_tokens: 800
+  agent_id: auto_character
 """,
         encoding="utf-8",
     )
@@ -222,6 +242,56 @@ def _book_profile_payload(tag: str = "") -> dict[str, str]:
         "protagonist_goal": f"查清走私链条并保护证人{suffix}",
         "core_conflict": f"真相揭露会牵连主角家人{suffix}",
         "narrative_style": f"冷峻纪实与心理描写并重{suffix}",
+    }
+
+
+def _auto_role_spec(name: str, *, agent_id: str | None = None) -> dict[str, object]:
+    return {
+        "agent_id": agent_id or name,
+        "identity": {
+            "姓名": name,
+            "称呼": name,
+            "身份": "关键角色",
+            "职业": "调查对象",
+            "阵营": "未知",
+        },
+        "personality": {
+            "性格关键词": "谨慎,克制",
+            "智力与思维方式": "先观察后行动",
+            "情绪基调": "稳定",
+            "道德倾向": "现实主义",
+            "做事风格": "试探推进",
+        },
+        "goals": {
+            "长期目标": "在复杂局势中自保",
+            "当前目标": "获取更多信息",
+            "隐藏动机": "隐藏真实身份",
+            "最在意什么": "安全",
+            "最害怕什么": "暴露",
+        },
+        "knowledge": {
+            "当前时间点": "第一季第八章",
+            "已知": "局部情报",
+            "未知": "幕后主谋",
+            "禁止": "剧外信息",
+        },
+        "language": {
+            "用词风格": "简洁",
+            "句子长短": "短句",
+            "口头禅": "",
+            "幽默倾向": "低",
+            "表达直接性": "中等",
+            "脏话边界": "不用",
+            "常用语气词": "",
+        },
+        "scene": {
+            "时间": "深夜",
+            "地点": "港口",
+            "对话对象": "主角",
+            "刚刚发生了什么": "线索曝光",
+            "当前关系张力": "高",
+            "本轮任务": "试探",
+        },
     }
 
 
@@ -594,6 +664,337 @@ def test_profile_context_is_injected_before_scene_context(tmp_path: Path) -> Non
     assert prompt.index("背景: 旧城与新港并存的秩序裂缝 P") < prompt.index("这是用户输入场景上下文")
 
 
+def test_start_accepts_participant_display_name_alias(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(tmp_path)
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=_build_transport(),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/books",
+            json={"book_id": "book_alias", "title": "Book Alias", "profile": _book_profile_payload("Alias")},
+        )
+        assert created.status_code == 200
+
+        start_resp = client.post(
+            "/api/control/scenes/start",
+            json={
+                "book_id": "book_alias",
+                "scene_id": "scene_alias",
+                "title": "别名解析",
+                "objective": "验证姓名可作为 participant",
+                "participants": ["主角"],
+                "context": "测试中文姓名映射",
+                "state": {"objective_achieved": False, "unresolved_conflicts": []},
+                "max_turns": 1,
+            },
+        )
+        assert start_resp.status_code == 200
+        assert start_resp.json()["status"] in {"objective_achieved", "max_turns_reached"}
+
+
+def test_auto_role_generation_on_profile_save_is_incremental(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(
+        tmp_path,
+        auto_character_enabled=True,
+        trigger_on_profile_save=True,
+        trigger_on_scene_start=False,
+    )
+    auto_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        model = body["model"]
+
+        if model == "auto-role-model":
+            auto_calls["count"] += 1
+            if auto_calls["count"] == 1:
+                roles = [_auto_role_spec("沈夜", agent_id="shenye")]
+            else:
+                roles = [
+                    _auto_role_spec("沈夜", agent_id="shenye"),
+                    _auto_role_spec("苏瑾", agent_id="sujin"),
+                ]
+            return _chat_response(json.dumps({"roles": roles}, ensure_ascii=False))
+
+        if model == "hero-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "试探",
+                        "speech": "先看看你的证词。",
+                        "action": "保持距离观察",
+                        "emotion": "克制",
+                        "target": "unknown",
+                        "reason": "继续收集情报",
+                        "goal_progress": "信息增量",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        if model == "director-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "resolved_action": {
+                            "intent": "推进",
+                            "speech": "继续。",
+                            "action": "稳态推进",
+                            "emotion": "冷静",
+                            "target": "unknown",
+                            "reason": "保持节奏",
+                            "goal_progress": "推进剧情",
+                        },
+                        "state_delta": {"objective_achieved": True, "objective_status": "achieved"},
+                        "conflict": None,
+                        "rationale": "通过",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        if model == "fallback-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "观察",
+                        "speech": "我在听。",
+                        "action": "沉默观察",
+                        "emotion": "平静",
+                        "target": "unknown",
+                        "reason": "判断局势",
+                        "goal_progress": "保持信息优势",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        raise AssertionError(f"Unexpected model: {model}")
+
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/books",
+            json={"book_id": "book_auto", "title": "Auto Book", "profile": _book_profile_payload("AUTO")},
+        )
+        assert created.status_code == 200
+        created_payload = created.json()
+        assert "auto_roles" in created_payload
+        assert created_payload["auto_roles"]["trigger"] == "profile_save"
+        assert len(created_payload["auto_roles"]["created"]) == 1
+        assert created_payload["auto_roles"]["created"][0]["agent_id"] == "shenye"
+
+        first_path = tmp_path / "book_skills" / "book_auto" / "characters" / "shenye.md"
+        assert first_path.exists()
+
+        patched = client.patch(
+            "/api/books/book_auto/profile",
+            json={"worldview": "现代都市与秘密社团并行 AUTO PATCH"},
+        )
+        assert patched.status_code == 200
+        patched_payload = patched.json()
+        assert "auto_roles" in patched_payload
+        assert patched_payload["auto_roles"]["trigger"] == "profile_save"
+        created_agent_ids = {item["agent_id"] for item in patched_payload["auto_roles"]["created"]}
+        assert "sujin" in created_agent_ids
+        assert (tmp_path / "book_skills" / "book_auto" / "characters" / "sujin.md").exists()
+
+    with sqlite3.connect(app.state.repo.sqlite_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT trigger, created_count, skipped_count, failed_count
+            FROM auto_role_generation_events
+            WHERE book_id = ?
+            ORDER BY id ASC
+            """,
+            ("book_auto",),
+        ).fetchall()
+        assert len(rows) == 2
+        assert all(row["trigger"] == "profile_save" for row in rows)
+        assert rows[0]["created_count"] >= 1
+        assert rows[1]["created_count"] >= 1
+        assert rows[1]["failed_count"] == 0
+
+
+def test_scene_start_jit_auto_role_generation_resolves_participants(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(
+        tmp_path,
+        auto_character_enabled=True,
+        trigger_on_profile_save=False,
+        trigger_on_scene_start=True,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        model = body["model"]
+
+        if model == "auto-role-model":
+            roles = [_auto_role_spec("沈夜", agent_id="shenye")]
+            return _chat_response(json.dumps({"roles": roles}, ensure_ascii=False))
+
+        if model == "fallback-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "压住情绪试探",
+                        "speech": "先把事实说清楚。",
+                        "action": "目光锁定对方",
+                        "emotion": "克制",
+                        "target": "unknown",
+                        "reason": "确认对方立场",
+                        "goal_progress": "推进信息收集",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        if model == "director-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "resolved_action": {
+                            "intent": "稳态推进",
+                            "speech": "继续对峙。",
+                            "action": "维持压迫感",
+                            "emotion": "紧绷",
+                            "target": "unknown",
+                            "reason": "推进冲突",
+                            "goal_progress": "推进一回合",
+                        },
+                        "state_delta": {"objective_achieved": True, "objective_status": "achieved"},
+                        "conflict": None,
+                        "rationale": "无冲突",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        if model == "hero-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "观察",
+                        "speech": "我先听你说。",
+                        "action": "沉默观察",
+                        "emotion": "平静",
+                        "target": "unknown",
+                        "reason": "等待线索",
+                        "goal_progress": "保持节奏",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        raise AssertionError(f"Unexpected model: {model}")
+
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/books",
+            json={"book_id": "book_jit", "title": "JIT Book", "profile": _book_profile_payload("JIT")},
+        )
+        assert created.status_code == 200
+        pre_generated = tmp_path / "book_skills" / "book_jit" / "characters" / "shenye.md"
+        assert not pre_generated.exists()
+
+        start_resp = client.post(
+            "/api/control/scenes/start",
+            json={
+                "book_id": "book_jit",
+                "scene_id": "scene_jit",
+                "title": "JIT 补角场景",
+                "objective": "通过自动补角解决参与者缺失",
+                "participants": ["沈夜"],
+                "context": "沈夜在码头现身，准备与主角摊牌。",
+                "state": {"objective_achieved": False, "unresolved_conflicts": []},
+                "max_turns": 1,
+            },
+        )
+        assert start_resp.status_code == 200
+        start_payload = start_resp.json()
+        assert "auto_roles" in start_payload
+        assert start_payload["auto_roles"]["trigger"] == "scene_start"
+        assert (tmp_path / "book_skills" / "book_jit" / "characters" / "shenye.md").exists()
+
+        turns_resp = client.get(
+            "/api/dashboard/scenes/scene_jit/turns",
+            params={"book_id": "book_jit"},
+        )
+        assert turns_resp.status_code == 200
+        turns = turns_resp.json()["items"]
+        assert turns
+        assert turns[0]["actor"] == "shenye"
+
+
+def test_book_skill_alias_overrides_shared_skill_alias(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(tmp_path)
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=_build_transport(),
+    )
+
+    book_skill_dir = tmp_path / "book_skills" / "book_alias_override" / "characters"
+    book_skill_dir.mkdir(parents=True, exist_ok=True)
+    _write_skill(book_skill_dir / "hero.md", name="沈夜", urgency=0.9, tension=0.8)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/books",
+            json={
+                "book_id": "book_alias_override",
+                "title": "Alias Override Book",
+                "profile": _book_profile_payload("AliasOverride"),
+            },
+        )
+        assert created.status_code == 200
+
+        started = client.post(
+            "/api/control/scenes/start",
+            json={
+                "book_id": "book_alias_override",
+                "scene_id": "scene_alias_override",
+                "title": "覆盖别名测试",
+                "objective": "书内角色别名优先生效",
+                "participants": ["沈夜"],
+                "context": "通过书内 skill 覆盖共享别名",
+                "state": {"objective_achieved": False, "unresolved_conflicts": []},
+                "max_turns": 1,
+            },
+        )
+        assert started.status_code == 200
+
+        turns = client.get(
+            "/api/dashboard/scenes/scene_alias_override/turns",
+            params={"book_id": "book_alias_override"},
+        )
+        assert turns.status_code == 200
+        turn_items = turns.json()["items"]
+        assert turn_items
+        assert turn_items[0]["actor"] == "hero"
+
+
 def test_async_run_with_pending_decision_and_user_selection(tmp_path: Path) -> None:
     urls, runtime, factory_cfg = _setup_files(tmp_path)
 
@@ -814,3 +1215,402 @@ def test_async_interrupt_triggers_same_turn_rerun(tmp_path: Path) -> None:
         assert len(turns) == 1
         assert turns[0]["action"]["action"] == "重算动作"
         assert hero_calls["count"] >= 2
+
+
+def test_dashboard_agent_runtime_state_summary_and_detail_endpoint(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        model = body["model"]
+        if model == "hero-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "推进",
+                        "speech": "继续推进。",
+                        "action": "观察",
+                        "emotion": "冷静",
+                        "target": None,
+                        "reason": "保持推进",
+                        "goal_progress": "完成一小步",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if model == "director-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "resolved_action": {
+                            "intent": "推进",
+                            "speech": "继续推进。",
+                            "action": "观察",
+                            "emotion": "冷静",
+                            "target": None,
+                            "reason": "保持推进",
+                            "goal_progress": "完成一小步",
+                        },
+                        "state_delta": {"objective_achieved": True, "objective_status": "achieved"},
+                        "conflict": None,
+                        "rationale": "动作合理",
+                        "confidence": 0.95,
+                        "character_updates": [
+                            {
+                                "target": "hero",
+                                "confidence": 0.9,
+                                "reason": "获得新资源",
+                                "changes": {
+                                    "age": 20,
+                                    "level_set": 4,
+                                    "inventory_add": ["银钥匙"],
+                                    "abilities_add": ["洞察"],
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        raise AssertionError(f"Unexpected model: {model}")
+
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        start_resp = client.post(
+            "/api/control/scenes/start",
+            json=_start_payload(DEFAULT_BOOK_ID, "scene_runtime_state"),
+        )
+        assert start_resp.status_code == 200
+
+        agents_resp = client.get(
+            "/api/dashboard/agents",
+            params={"book_id": DEFAULT_BOOK_ID},
+        )
+        assert agents_resp.status_code == 200
+        hero_item = next(
+            item for item in agents_resp.json()["items"] if item["agent_id"] == "hero"
+        )
+        assert hero_item["age"] == 20
+        assert hero_item["level"] == 4
+        assert hero_item["inventory_count"] == 1
+        assert hero_item["abilities_count"] == 1
+        assert hero_item["last_state_update_at"] is not None
+
+        detail_resp = client.get(
+            "/api/dashboard/agents/hero/state",
+            params={"book_id": DEFAULT_BOOK_ID},
+        )
+        assert detail_resp.status_code == 200
+        payload = detail_resp.json()
+        assert payload["agent_id"] == "hero"
+        assert payload["level"] == 4
+        assert payload["inventory"] == ["银钥匙"]
+        assert payload["abilities"] == ["洞察"]
+        assert payload["change_events"]
+        assert payload["change_events"][0]["applied_status"] == "applied_auto"
+
+
+def test_async_low_confidence_state_update_waits_for_user_selection(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        model = body["model"]
+        if model == "hero-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "稳定推进",
+                        "speech": "保持节奏。",
+                        "action": "稳步推进",
+                        "emotion": "克制",
+                        "target": None,
+                        "reason": "控制风险",
+                        "goal_progress": "向前推进",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if model == "director-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "resolved_action": {
+                            "intent": "稳定推进",
+                            "speech": "保持节奏。",
+                            "action": "稳步推进",
+                            "emotion": "克制",
+                            "target": None,
+                            "reason": "控制风险",
+                            "goal_progress": "向前推进",
+                        },
+                        "state_delta": {"objective_achieved": False},
+                        "conflict": None,
+                        "rationale": "动作可信，但状态变更不确定",
+                        "confidence": 0.95,
+                        "character_updates": [
+                            {
+                                "target": "hero",
+                                "confidence": 0.4,
+                                "reason": "可能获得等级提升",
+                                "changes": {"level_set": 7},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        raise AssertionError(f"Unexpected model: {model}")
+
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        patch_resp = client.patch(
+            "/api/books/book_a/interactive-settings",
+            json={"uncertainty_enabled": True, "decision_timeout_seconds": 120},
+        )
+        assert patch_resp.status_code == 200
+        assert patch_resp.json()["uncertainty_enabled"] is True
+
+        start_resp = client.post(
+            "/api/control/scenes/start_async",
+            json={
+                "book_id": "book_a",
+                "scene_id": "scene_state_wait",
+                "title": "状态更新待确认",
+                "objective": "验证低置信度状态询问",
+                "participants": ["hero"],
+                "context": "等待用户确认状态更新",
+                "state": {"objective_achieved": False},
+                "max_turns": 1,
+            },
+        )
+        assert start_resp.status_code == 200
+
+        pending_item = None
+        for _ in range(30):
+            pending_resp = client.get(
+                "/api/control/scenes/scene_state_wait/decisions/pending",
+                params={"book_id": "book_a"},
+            )
+            assert pending_resp.status_code == 200
+            pending_item = pending_resp.json()["item"]
+            if pending_item:
+                break
+            time.sleep(0.05)
+
+        assert pending_item is not None
+        option_ids = {item["id"] for item in pending_item["options"]}
+        assert {"state_update_apply", "state_update_discard"} <= option_ids
+        assert pending_item["metadata"]["decision_type"] == "character_state_update"
+
+        select_resp = client.post(
+            f"/api/control/scenes/scene_state_wait/decisions/{pending_item['request_id']}/select",
+            json={"book_id": "book_a", "selected_option": "state_update_apply"},
+        )
+        assert select_resp.status_code == 200
+        assert select_resp.json()["status"] == "resolved"
+
+        completed = None
+        for _ in range(35):
+            run_resp = client.get(
+                "/api/control/scenes/scene_state_wait/run",
+                params={"book_id": "book_a"},
+            )
+            assert run_resp.status_code == 200
+            completed = run_resp.json()
+            if completed["status"] == "completed":
+                break
+            time.sleep(0.05)
+        assert completed is not None
+        assert completed["status"] == "completed"
+
+        state_resp = client.get(
+            "/api/dashboard/agents/hero/state",
+            params={"book_id": "book_a"},
+        )
+        assert state_resp.status_code == 200
+        payload = state_resp.json()
+        assert payload["level"] == 7
+        assert any(
+            event["applied_status"] == "applied_user"
+            for event in payload["change_events"]
+        )
+
+
+def test_pause_during_state_decision_cleans_pending_and_avoids_state_leak(tmp_path: Path) -> None:
+    urls, runtime, factory_cfg = _setup_files(tmp_path)
+    director_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        model = body["model"]
+        if model == "hero-model":
+            return _chat_response(
+                json.dumps(
+                    {
+                        "intent": "继续推进",
+                        "speech": "按计划推进。",
+                        "action": "稳步施压",
+                        "emotion": "克制",
+                        "target": None,
+                        "reason": "保持节奏",
+                        "goal_progress": "逐步逼近目标",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if model == "director-model":
+            director_calls["count"] += 1
+            if director_calls["count"] == 1:
+                return _chat_response(
+                    json.dumps(
+                        {
+                            "accepted": True,
+                            "resolved_action": {
+                                "intent": "继续推进",
+                                "speech": "按计划推进。",
+                                "action": "稳步施压",
+                                "emotion": "克制",
+                                "target": None,
+                                "reason": "保持节奏",
+                                "goal_progress": "逐步逼近目标",
+                            },
+                            "state_delta": {"leak_marker": "should_not_persist"},
+                            "conflict": None,
+                            "rationale": "动作通过，状态更新待确认",
+                            "confidence": 0.95,
+                            "character_updates": [
+                                {
+                                    "target": "hero",
+                                    "confidence": 0.35,
+                                    "reason": "等级变化证据不足",
+                                    "changes": {"level_set": 8},
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            return _chat_response(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "resolved_action": {
+                            "intent": "收束回合",
+                            "speech": "继续执行。",
+                            "action": "收束推进",
+                            "emotion": "平静",
+                            "target": None,
+                            "reason": "结束当前场景",
+                            "goal_progress": "目标达成",
+                        },
+                        "state_delta": {"objective_achieved": True, "objective_status": "achieved"},
+                        "conflict": None,
+                        "rationale": "通过",
+                        "confidence": 0.95,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        raise AssertionError(f"Unexpected model: {model}")
+
+    app = create_dashboard_app(
+        urls_config_path=str(urls),
+        runtime_config_path=str(runtime),
+        factory_config_path=str(factory_cfg),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        patch_resp = client.patch(
+            "/api/books/book_a/interactive-settings",
+            json={"uncertainty_enabled": True, "decision_timeout_seconds": 120},
+        )
+        assert patch_resp.status_code == 200
+
+        start_resp = client.post(
+            "/api/control/scenes/start_async",
+            json={
+                "book_id": "book_a",
+                "scene_id": "scene_pause_cleanup",
+                "title": "暂停清理决策单",
+                "objective": "验证决策清理与状态不污染",
+                "participants": ["hero"],
+                "context": "触发等待用户后立即暂停",
+                "state": {"objective_achieved": False},
+                "max_turns": 1,
+            },
+        )
+        assert start_resp.status_code == 200
+
+        pending_item = None
+        for _ in range(30):
+            pending_resp = client.get(
+                "/api/control/scenes/scene_pause_cleanup/decisions/pending",
+                params={"book_id": "book_a"},
+            )
+            assert pending_resp.status_code == 200
+            pending_item = pending_resp.json()["item"]
+            if pending_item:
+                break
+            time.sleep(0.05)
+        assert pending_item is not None
+        assert pending_item["metadata"]["decision_type"] == "character_state_update"
+
+        pause_resp = client.post(
+            "/api/control/scenes/scene_pause_cleanup/pause",
+            json={"book_id": "book_a", "message": "pause for revision"},
+        )
+        assert pause_resp.status_code == 200
+        assert pause_resp.json()["status"] == "paused"
+
+        pending_after_pause = pending_item
+        for _ in range(40):
+            pending_resp = client.get(
+                "/api/control/scenes/scene_pause_cleanup/decisions/pending",
+                params={"book_id": "book_a"},
+            )
+            assert pending_resp.status_code == 200
+            pending_after_pause = pending_resp.json()["item"]
+            if pending_after_pause is None:
+                break
+            time.sleep(0.05)
+        assert pending_after_pause is None
+
+        resume_resp = client.post(
+            "/api/control/scenes/scene_pause_cleanup/resume",
+            json={"book_id": "book_a", "message": "resume after cleanup"},
+        )
+        assert resume_resp.status_code == 200
+
+        completed = None
+        for _ in range(45):
+            run_resp = client.get(
+                "/api/control/scenes/scene_pause_cleanup/run",
+                params={"book_id": "book_a"},
+            )
+            assert run_resp.status_code == 200
+            completed = run_resp.json()
+            if completed["status"] == "completed":
+                break
+            time.sleep(0.05)
+
+        assert completed is not None
+        assert completed["status"] == "completed"
+        final_state = completed["summary"]["final_state"]
+        assert final_state["objective_achieved"] is True
+        assert "leak_marker" not in final_state

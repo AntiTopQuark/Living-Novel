@@ -6,3 +6,5 @@ data/*.db
 frontend/dashboard/node_modules/
 frontend/dashboard/dist/
 frontend/dashboard/.vitest/
+config/llm_runtime.yaml
+config/llm_urls.yaml

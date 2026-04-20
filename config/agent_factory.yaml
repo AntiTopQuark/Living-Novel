@@ -23,3 +23,22 @@ action:
   temperature: 0.7
   max_tokens: 700
   max_retries: 2
+
+auto_character:
+  enabled: true
+  trigger_on_profile_save: true
+  trigger_on_scene_start: true
+  book_skills_root: "skills/books"
+  overwrite_existing: false
+  max_new_roles_per_run:
+  provider:
+  model:
+  temperature: 0.4
+  max_tokens: 1800
+  agent_id: "auto_character"
+
+character_state:
+  enabled: true
+  auto_apply_confidence: 0.75
+  max_updates_per_turn: 8
+  persist_change_events: true

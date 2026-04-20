@@ -14,6 +14,8 @@ from common.llm import LLMClientManager, LLMRequest
 from .schema import (
     ActionValidationError,
     AgentAction,
+    CharacterRuntimeState,
+    CharacterStateUpdate,
     DirectorDecision,
     MemoryEvent,
     SceneInput,
@@ -88,6 +90,42 @@ class MemoryStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_runtime_states (
+                    book_id TEXT NOT NULL DEFAULT 'default_book',
+                    agent_id TEXT NOT NULL,
+                    age INTEGER,
+                    personality_traits_json TEXT NOT NULL,
+                    inventory_json TEXT NOT NULL,
+                    level INTEGER,
+                    abilities_json TEXT NOT NULL,
+                    extras_json TEXT NOT NULL,
+                    updated_turn INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (book_id, agent_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_state_change_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id TEXT NOT NULL DEFAULT 'default_book',
+                    scene_id TEXT NOT NULL,
+                    turn INTEGER NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    changes_json TEXT NOT NULL,
+                    before_json TEXT NOT NULL,
+                    after_json TEXT NOT NULL,
+                    applied_status TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             self._ensure_column(
                 conn,
                 "agent_memory_events",
@@ -116,6 +154,12 @@ class MemoryStore:
                 "UPDATE scene_state_snapshots SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
             )
             conn.execute(
+                "UPDATE agent_runtime_states SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
+            )
+            conn.execute(
+                "UPDATE agent_state_change_events SET book_id = 'default_book' WHERE book_id IS NULL OR book_id = ''"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mem_agent_scene ON agent_memory_events(book_id, agent_id, scene_id)"
             )
             conn.execute(
@@ -123,6 +167,12 @@ class MemoryStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_scene ON scene_state_snapshots(book_id, scene_id, turn)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runtime_states_book_agent ON agent_runtime_states(book_id, agent_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_state_change_events_book_agent ON agent_state_change_events(book_id, agent_id, created_at DESC)"
             )
 
     @staticmethod
@@ -206,6 +256,199 @@ class MemoryStore:
         result = [event for _, event in scored[:top_k]]
         result.sort(key=lambda event: event.turn)
         return result
+
+    def get_runtime_state(self, *, book_id: str, agent_id: str) -> CharacterRuntimeState:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    book_id,
+                    agent_id,
+                    age,
+                    personality_traits_json,
+                    inventory_json,
+                    level,
+                    abilities_json,
+                    extras_json,
+                    updated_turn,
+                    updated_at
+                FROM agent_runtime_states
+                WHERE book_id = ? AND agent_id = ?
+                """,
+                (book_id, agent_id),
+            ).fetchone()
+        if row is None:
+            return CharacterRuntimeState(book_id=book_id, agent_id=agent_id)
+        return _row_to_runtime_state(row)
+
+    def upsert_runtime_state(self, state: CharacterRuntimeState) -> CharacterRuntimeState:
+        now = datetime.now(timezone.utc).isoformat()
+        updated_at = (
+            state.updated_at.astimezone(timezone.utc).isoformat()
+            if isinstance(state.updated_at, datetime)
+            else now
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_runtime_states(
+                    book_id,
+                    agent_id,
+                    age,
+                    personality_traits_json,
+                    inventory_json,
+                    level,
+                    abilities_json,
+                    extras_json,
+                    updated_turn,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(book_id, agent_id) DO UPDATE SET
+                    age = excluded.age,
+                    personality_traits_json = excluded.personality_traits_json,
+                    inventory_json = excluded.inventory_json,
+                    level = excluded.level,
+                    abilities_json = excluded.abilities_json,
+                    extras_json = excluded.extras_json,
+                    updated_turn = excluded.updated_turn,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    state.book_id,
+                    state.agent_id,
+                    state.age,
+                    json.dumps(state.personality_traits, ensure_ascii=False),
+                    json.dumps(state.inventory, ensure_ascii=False),
+                    state.level,
+                    json.dumps(state.abilities, ensure_ascii=False),
+                    json.dumps(state.extras, ensure_ascii=False),
+                    int(state.updated_turn),
+                    updated_at,
+                ),
+            )
+        return self.get_runtime_state(book_id=state.book_id, agent_id=state.agent_id)
+
+    def apply_state_update(
+        self,
+        *,
+        book_id: str,
+        scene_id: str,
+        turn: int,
+        update: CharacterStateUpdate,
+        applied_status: str,
+        source: str,
+        apply: bool = True,
+        persist_event: bool = True,
+    ) -> dict[str, Any]:
+        before_state = self.get_runtime_state(book_id=book_id, agent_id=update.target)
+        before_payload = _runtime_state_to_payload(before_state)
+
+        if apply:
+            after_state = _merge_runtime_state(before_state, update.changes, updated_turn=turn)
+            persisted_state = self.upsert_runtime_state(after_state)
+            after_payload = _runtime_state_to_payload(persisted_state)
+        else:
+            persisted_state = before_state
+            after_payload = before_payload
+
+        event_payload = {
+            "id": None,
+            "book_id": book_id,
+            "scene_id": scene_id,
+            "turn": int(turn),
+            "agent_id": update.target,
+            "confidence": float(update.confidence),
+            "reason": update.reason,
+            "changes": copy.deepcopy(update.changes),
+            "before_state": before_payload,
+            "after_state": after_payload,
+            "applied_status": applied_status,
+            "source": source,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if persist_event:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO agent_state_change_events(
+                        book_id,
+                        scene_id,
+                        turn,
+                        agent_id,
+                        confidence,
+                        reason,
+                        changes_json,
+                        before_json,
+                        after_json,
+                        applied_status,
+                        source,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        book_id,
+                        scene_id,
+                        int(turn),
+                        update.target,
+                        float(update.confidence),
+                        update.reason,
+                        json.dumps(update.changes, ensure_ascii=False),
+                        json.dumps(before_payload, ensure_ascii=False),
+                        json.dumps(after_payload, ensure_ascii=False),
+                        applied_status,
+                        source,
+                        event_payload["created_at"],
+                    ),
+                )
+                event_payload["id"] = int(cursor.lastrowid)
+
+        event_payload["applied"] = apply
+        event_payload["runtime_state"] = _runtime_state_to_payload(persisted_state)
+        return event_payload
+
+    def list_state_changes(
+        self,
+        *,
+        book_id: str,
+        agent_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    book_id,
+                    scene_id,
+                    turn,
+                    agent_id,
+                    confidence,
+                    reason,
+                    changes_json,
+                    before_json,
+                    after_json,
+                    applied_status,
+                    source,
+                    created_at
+                FROM agent_state_change_events
+                WHERE book_id = ? AND agent_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (book_id, agent_id, max(1, int(limit))),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["turn"] = int(item["turn"] or 0)
+            item["confidence"] = float(item["confidence"] or 0.0)
+            item["changes"] = _safe_json_loads(item.pop("changes_json")) or {}
+            item["before_state"] = _safe_json_loads(item.pop("before_json")) or {}
+            item["after_state"] = _safe_json_loads(item.pop("after_json")) or {}
+            results.append(item)
+        return results
 
     def append_turn_log(
         self,
@@ -338,6 +581,14 @@ class SceneOrchestrator:
                 decision=decision,
             )
 
+            self._apply_character_updates_sync(
+                book_id=scene_input.book_id,
+                scene_id=scene_input.scene_id,
+                turn=turn,
+                decision=decision,
+                agents=agents,
+            )
+
             turn_log = TurnLog(
                 book_id=scene_input.book_id,
                 scene_id=scene_input.scene_id,
@@ -453,10 +704,14 @@ class SceneOrchestrator:
         logs: list[TurnLog],
     ) -> DirectorDecision:
         director_cfg = self._config.director
+        runtime_state_summary = self._build_runtime_state_summary(scene_input)
         system_prompt = (
             "你是导演 Agent，负责裁决角色行动是否与剧情一致。"
             "你必须输出 JSON object。"
-            "字段: accepted(bool), resolved_action(object), state_delta(object), conflict(string|null), rationale(string), confidence(number,0-1)。"
+            "字段: accepted(bool), resolved_action(object), state_delta(object), conflict(string|null), rationale(string), confidence(number,0-1), character_updates(array, 可选)。"
+            "character_updates 每项字段: target(string), confidence(number,0-1), reason(string), changes(object)。"
+            "changes 允许键: age, personality_traits_add/remove, inventory_add/remove, "
+            "level_set/level_delta, abilities_add/remove, extras_set/remove。"
             "若通过动作，resolved_action 可与输入一致；若冲突请修正。"
         )
 
@@ -470,6 +725,7 @@ class SceneOrchestrator:
             f"scene_id={scene_input.scene_id}; title={scene_input.title}; objective={scene_input.objective}\n"
             f"scene_state={scene_input.state}\n"
             f"unresolved_conflicts={scene_input.unresolved_conflicts}\n"
+            f"runtime_states={runtime_state_summary}\n"
             f"recent_logs={recent_log_text or '- 无'}\n"
             f"proposed_action={asdict(proposed_action)}"
         )
@@ -509,7 +765,8 @@ class SceneOrchestrator:
                                 "你的输出未通过 JSON/字段校验。"
                                 f"错误: {exc}. "
                                 "请返回合法 JSON，字段必须包含 "
-                                "accepted,resolved_action,state_delta,conflict,rationale,confidence。"
+                                "accepted,resolved_action,state_delta,conflict,rationale,confidence；"
+                                "可选字段: character_updates。"
                             ),
                         },
                     ]
@@ -522,6 +779,7 @@ class SceneOrchestrator:
             conflict=f"director_output_invalid: {last_error}",
             rationale="Director fallback: invalid model output",
             confidence=0.0,
+            character_updates=[],
         )
 
     def _persist_turn(self, book_id: str, scene_id: str, turn_log: TurnLog) -> None:
@@ -533,6 +791,7 @@ class SceneOrchestrator:
             "conflict": turn_log.decision.conflict,
             "rationale": turn_log.decision.rationale,
             "confidence": turn_log.decision.confidence,
+            "character_updates": [asdict(item) for item in turn_log.decision.character_updates],
         }
         self._memory_store.append_turn_log(
             book_id=book_id,
@@ -587,6 +846,154 @@ class SceneOrchestrator:
                     tags=["targeted-event"],
                 )
             )
+
+    def _build_runtime_state_summary(self, scene_input: SceneInput) -> dict[str, dict[str, Any]]:
+        participants = set(scene_input.participants)
+        summary: dict[str, dict[str, Any]] = {}
+        for agent_id in sorted(participants):
+            state = self._memory_store.get_runtime_state(
+                book_id=scene_input.book_id,
+                agent_id=agent_id,
+            )
+            summary[agent_id] = {
+                "age": state.age,
+                "level": state.level,
+                "personality_traits": state.personality_traits,
+                "inventory": state.inventory,
+                "abilities": state.abilities,
+                "extras": state.extras,
+                "updated_turn": state.updated_turn,
+            }
+        return summary
+
+    def _apply_character_updates_sync(
+        self,
+        *,
+        book_id: str,
+        scene_id: str,
+        turn: int,
+        decision: DirectorDecision,
+        agents: dict[str, ActionAgent],
+    ) -> list[dict[str, Any]]:
+        if not getattr(self._config.character_state, "enabled", True):
+            return []
+
+        max_updates = int(getattr(self._config.character_state, "max_updates_per_turn", 8))
+        min_confidence = float(getattr(self._config.character_state, "auto_apply_confidence", 0.75))
+        persist_events = bool(getattr(self._config.character_state, "persist_change_events", True))
+        applied_events: list[dict[str, Any]] = []
+
+        for update in decision.character_updates[:max_updates]:
+            if update.target not in agents:
+                event = self._memory_store.apply_state_update(
+                    book_id=book_id,
+                    scene_id=scene_id,
+                    turn=turn,
+                    update=update,
+                    applied_status="invalid_target",
+                    source="director_sync",
+                    apply=False,
+                    persist_event=persist_events,
+                )
+                applied_events.append(event)
+                continue
+
+            should_apply = float(update.confidence) >= min_confidence
+            applied_status = "applied_auto" if should_apply else "skipped_low_confidence"
+            event = self._memory_store.apply_state_update(
+                book_id=book_id,
+                scene_id=scene_id,
+                turn=turn,
+                update=update,
+                applied_status=applied_status,
+                source="director_sync",
+                apply=should_apply,
+                persist_event=persist_events,
+            )
+            applied_events.append(event)
+            if should_apply:
+                self._persist_state_update_memories(
+                    book_id=book_id,
+                    scene_id=scene_id,
+                    turn=turn,
+                    update=update,
+                    event=event,
+                )
+
+        return applied_events
+
+    def apply_character_update_event(
+        self,
+        *,
+        book_id: str,
+        scene_id: str,
+        turn: int,
+        update: CharacterStateUpdate,
+        applied_status: str,
+        source: str,
+        apply: bool,
+    ) -> dict[str, Any]:
+        persist_events = bool(getattr(self._config.character_state, "persist_change_events", True))
+        event = self._memory_store.apply_state_update(
+            book_id=book_id,
+            scene_id=scene_id,
+            turn=turn,
+            update=update,
+            applied_status=applied_status,
+            source=source,
+            apply=apply,
+            persist_event=persist_events,
+        )
+        if apply:
+            self._persist_state_update_memories(
+                book_id=book_id,
+                scene_id=scene_id,
+                turn=turn,
+                update=update,
+                event=event,
+            )
+        return event
+
+    def _persist_state_update_memories(
+        self,
+        *,
+        book_id: str,
+        scene_id: str,
+        turn: int,
+        update: CharacterStateUpdate,
+        event: dict[str, Any],
+    ) -> None:
+        after_state = event.get("after_state") if isinstance(event, dict) else {}
+        summary = (
+            f"导演更新了你的状态: reason={update.reason}; "
+            f"changes={json.dumps(update.changes, ensure_ascii=False)}; "
+            f"after={json.dumps(after_state, ensure_ascii=False)}"
+        )
+        self._memory_store.append(
+            MemoryEvent(
+                book_id=book_id,
+                agent_id=update.target,
+                scene_id=scene_id,
+                turn=turn,
+                content=summary,
+                importance=0.9,
+                tags=["state-update", "director"],
+            )
+        )
+        self._memory_store.append(
+            MemoryEvent(
+                book_id=book_id,
+                agent_id="director_global",
+                scene_id=scene_id,
+                turn=turn,
+                content=(
+                    f"状态更新已应用: target={update.target}; "
+                    f"reason={update.reason}; confidence={update.confidence:.2f}"
+                ),
+                importance=0.8,
+                tags=["state-update-summary", "director"],
+            )
+        )
 
 
 def _is_objective_achieved(state: dict[str, Any]) -> bool:
@@ -659,3 +1066,193 @@ def re_search_number(text: str) -> str | None:
     if not matched:
         return None
     return matched.group(0)
+
+
+def _safe_json_loads(raw: Any) -> Any:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _row_to_runtime_state(row: sqlite3.Row) -> CharacterRuntimeState:
+    updated_at_raw = row["updated_at"]
+    updated_at: datetime | None = None
+    if updated_at_raw:
+        try:
+            updated_at = datetime.fromisoformat(str(updated_at_raw))
+        except ValueError:
+            updated_at = None
+    return CharacterRuntimeState(
+        book_id=str(row["book_id"] or "default_book"),
+        agent_id=str(row["agent_id"]),
+        age=_coerce_int(row["age"]),
+        personality_traits=_normalize_text_list(_safe_json_loads(row["personality_traits_json"])),
+        inventory=_normalize_text_list(_safe_json_loads(row["inventory_json"])),
+        level=_coerce_int(row["level"]),
+        abilities=_normalize_text_list(_safe_json_loads(row["abilities_json"])),
+        extras=_normalize_dict(_safe_json_loads(row["extras_json"])),
+        updated_turn=int(row["updated_turn"] or 0),
+        updated_at=updated_at,
+    )
+
+
+def _runtime_state_to_payload(state: CharacterRuntimeState) -> dict[str, Any]:
+    return {
+        "book_id": state.book_id,
+        "agent_id": state.agent_id,
+        "age": state.age,
+        "personality_traits": list(state.personality_traits),
+        "inventory": list(state.inventory),
+        "level": state.level,
+        "abilities": list(state.abilities),
+        "extras": copy.deepcopy(state.extras),
+        "updated_turn": int(state.updated_turn),
+        "updated_at": state.updated_at.astimezone(timezone.utc).isoformat()
+        if isinstance(state.updated_at, datetime)
+        else None,
+    }
+
+
+def _merge_runtime_state(
+    base: CharacterRuntimeState,
+    changes: dict[str, Any],
+    *,
+    updated_turn: int,
+) -> CharacterRuntimeState:
+    next_state = CharacterRuntimeState(
+        book_id=base.book_id,
+        agent_id=base.agent_id,
+        age=base.age,
+        personality_traits=list(base.personality_traits),
+        inventory=list(base.inventory),
+        level=base.level,
+        abilities=list(base.abilities),
+        extras=copy.deepcopy(base.extras),
+        updated_turn=int(updated_turn),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    if "age" in changes:
+        age_value = _coerce_int(changes.get("age"))
+        if age_value is not None:
+            next_state.age = age_value
+
+    if "personality_traits_add" in changes:
+        additions = _normalize_text_list(changes.get("personality_traits_add"))
+        next_state.personality_traits = _merge_list_add(next_state.personality_traits, additions)
+    if "personality_traits_remove" in changes:
+        removals = _normalize_text_list(changes.get("personality_traits_remove"))
+        next_state.personality_traits = _merge_list_remove(next_state.personality_traits, removals)
+
+    if "inventory_add" in changes:
+        additions = _normalize_text_list(changes.get("inventory_add"))
+        next_state.inventory = _merge_list_add(next_state.inventory, additions)
+    if "inventory_remove" in changes:
+        removals = _normalize_text_list(changes.get("inventory_remove"))
+        next_state.inventory = _merge_list_remove(next_state.inventory, removals)
+
+    if "level_set" in changes:
+        level_set_value = _coerce_int(changes.get("level_set"))
+        if level_set_value is not None:
+            next_state.level = level_set_value
+    elif "level_delta" in changes:
+        delta = _coerce_int(changes.get("level_delta"))
+        if delta is not None:
+            current = next_state.level or 0
+            next_state.level = current + delta
+
+    if "abilities_add" in changes:
+        additions = _normalize_text_list(changes.get("abilities_add"))
+        next_state.abilities = _merge_list_add(next_state.abilities, additions)
+    if "abilities_remove" in changes:
+        removals = _normalize_text_list(changes.get("abilities_remove"))
+        next_state.abilities = _merge_list_remove(next_state.abilities, removals)
+
+    if "extras_set" in changes:
+        extras_set = changes.get("extras_set")
+        if isinstance(extras_set, dict):
+            merged = dict(next_state.extras)
+            for key, value in extras_set.items():
+                clean_key = str(key).strip()
+                if clean_key:
+                    merged[clean_key] = value
+            next_state.extras = merged
+    if "extras_remove" in changes:
+        extras_remove = _normalize_text_list(changes.get("extras_remove"))
+        remove_keys = {item.casefold() for item in extras_remove}
+        next_state.extras = {
+            key: value
+            for key, value in next_state.extras.items()
+            if key.casefold() not in remove_keys
+        }
+
+    return next_state
+
+
+def _normalize_text_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def _merge_list_add(existing: list[str], additions: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in existing + additions:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _merge_list_remove(existing: list[str], removals: list[str]) -> list[str]:
+    remove_keys = {item.casefold() for item in removals}
+    return [item for item in existing if item.casefold() not in remove_keys]
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            clean_key = str(key).strip()
+            if clean_key:
+                result[clean_key] = item
+        return result
+    return {}

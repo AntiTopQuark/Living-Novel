@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -21,11 +22,13 @@ from pydantic import BaseModel, Field
 from common.agents import (
     AgentAction,
     AgentFactory,
+    CharacterStateUpdate,
     DirectorDecision,
     MemoryEvent,
     SceneInput,
     TurnLog,
 )
+from common.agents.auto_character import AutoCharacterService, AutoRoleGenerationResult
 
 
 DEFAULT_BOOK_ID = "default_book"
@@ -136,6 +139,8 @@ class DashboardRepository:
             self._create_run_sessions_table(conn)
             self._create_interventions_table(conn)
             self._create_decision_requests_table(conn)
+            self._create_auto_role_events_table(conn)
+            self._create_character_state_tables(conn)
 
             if self._table_exists(conn, "scene_turn_logs"):
                 conn.execute(
@@ -386,6 +391,78 @@ class DashboardRepository:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scene_decision_book_scene_status ON scene_decision_requests(book_id, scene_id, status, created_at DESC)"
+        )
+
+    @staticmethod
+    def _create_auto_role_events_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_role_generation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                scene_id TEXT,
+                created_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                created_json TEXT NOT NULL,
+                skipped_json TEXT NOT NULL,
+                failed_json TEXT NOT NULL,
+                duration_ms REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_role_events_book_created ON auto_role_generation_events(book_id, created_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_role_events_trigger ON auto_role_generation_events(trigger, created_at DESC)"
+        )
+
+    @staticmethod
+    def _create_character_state_tables(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_runtime_states (
+                book_id TEXT NOT NULL DEFAULT 'default_book',
+                agent_id TEXT NOT NULL,
+                age INTEGER,
+                personality_traits_json TEXT NOT NULL,
+                inventory_json TEXT NOT NULL,
+                level INTEGER,
+                abilities_json TEXT NOT NULL,
+                extras_json TEXT NOT NULL,
+                updated_turn INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (book_id, agent_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_state_change_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT NOT NULL DEFAULT 'default_book',
+                scene_id TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                changes_json TEXT NOT NULL,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                applied_status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runtime_states_book_agent ON agent_runtime_states(book_id, agent_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_state_change_events_book_agent ON agent_state_change_events(book_id, agent_id, created_at DESC)"
         )
 
     def list_books(self) -> list[dict[str, Any]]:
@@ -866,6 +943,7 @@ class DashboardRepository:
             agent_id = str(row["agent_id"])
             latest_log = self._get_latest_action_for_agent(book_id, agent_id)
             memory_summary = self._get_latest_memory_for_agent(book_id, agent_id)
+            runtime_summary = self._get_runtime_state_summary(book_id, agent_id)
             results.append(
                 {
                     "book_id": book_id,
@@ -878,9 +956,122 @@ class DashboardRepository:
                     "memory_events": memory_summary.get("event_count", 0),
                     "memory_last_content": memory_summary.get("last_content"),
                     "memory_last_at": memory_summary.get("last_created_at"),
+                    "age": runtime_summary.get("age"),
+                    "level": runtime_summary.get("level"),
+                    "inventory_count": runtime_summary.get("inventory_count", 0),
+                    "abilities_count": runtime_summary.get("abilities_count", 0),
+                    "last_state_update_at": runtime_summary.get("updated_at"),
                 }
             )
         return results
+
+    def get_agent_runtime_state(self, *, book_id: str, agent_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            state_row = conn.execute(
+                """
+                SELECT
+                    book_id,
+                    agent_id,
+                    age,
+                    personality_traits_json,
+                    inventory_json,
+                    level,
+                    abilities_json,
+                    extras_json,
+                    updated_turn,
+                    updated_at
+                FROM agent_runtime_states
+                WHERE book_id = ? AND agent_id = ?
+                """,
+                (book_id, agent_id),
+            ).fetchone()
+
+        if state_row is None:
+            state_payload = {
+                "book_id": book_id,
+                "agent_id": agent_id,
+                "age": None,
+                "personality_traits": [],
+                "inventory": [],
+                "level": None,
+                "abilities": [],
+                "extras": {},
+                "updated_turn": 0,
+                "updated_at": None,
+            }
+        else:
+            state_payload = {
+                "book_id": state_row["book_id"] or book_id,
+                "agent_id": state_row["agent_id"] or agent_id,
+                "age": int(state_row["age"]) if state_row["age"] is not None else None,
+                "personality_traits": _load_json(state_row["personality_traits_json"]) or [],
+                "inventory": _load_json(state_row["inventory_json"]) or [],
+                "level": int(state_row["level"]) if state_row["level"] is not None else None,
+                "abilities": _load_json(state_row["abilities_json"]) or [],
+                "extras": _load_json(state_row["extras_json"]) or {},
+                "updated_turn": int(state_row["updated_turn"] or 0),
+                "updated_at": state_row["updated_at"],
+            }
+
+        state_payload["change_events"] = self.list_agent_state_changes(
+            book_id=book_id,
+            agent_id=agent_id,
+            limit=30,
+        )
+        return state_payload
+
+    def list_agent_state_changes(
+        self,
+        *,
+        book_id: str,
+        agent_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    book_id,
+                    scene_id,
+                    turn,
+                    agent_id,
+                    confidence,
+                    reason,
+                    changes_json,
+                    before_json,
+                    after_json,
+                    applied_status,
+                    source,
+                    created_at
+                FROM agent_state_change_events
+                WHERE book_id = ? AND agent_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (book_id, agent_id, max(1, int(limit))),
+            ).fetchall()
+
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            events.append(
+                {
+                    "id": int(row["id"]),
+                    "book_id": row["book_id"],
+                    "scene_id": row["scene_id"],
+                    "turn": int(row["turn"] or 0),
+                    "agent_id": row["agent_id"],
+                    "confidence": float(row["confidence"] or 0.0),
+                    "reason": row["reason"],
+                    "changes": _load_json(row["changes_json"]) or {},
+                    "before_state": _load_json(row["before_json"]) or {},
+                    "after_state": _load_json(row["after_json"]) or {},
+                    "applied_status": row["applied_status"],
+                    "source": row["source"],
+                    "created_at": row["created_at"],
+                }
+            )
+        return events
 
     def _get_latest_action_for_agent(self, book_id: str, agent_id: str) -> dict[str, Any]:
         with self._connect() as conn:
@@ -926,6 +1117,37 @@ class DashboardRepository:
             "event_count": event_count,
             "last_created_at": summary["last_created_at"] if summary else None,
             "last_content": latest["content"] if latest else None,
+        }
+
+    def _get_runtime_state_summary(self, book_id: str, agent_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT age, level, inventory_json, abilities_json, updated_at
+                FROM agent_runtime_states
+                WHERE book_id = ? AND agent_id = ?
+                """,
+                (book_id, agent_id),
+            ).fetchone()
+        if row is None:
+            return {
+                "age": None,
+                "level": None,
+                "inventory_count": 0,
+                "abilities_count": 0,
+                "updated_at": None,
+            }
+
+        inventory = _load_json(row["inventory_json"])
+        abilities = _load_json(row["abilities_json"])
+        inventory_count = len(inventory) if isinstance(inventory, list) else 0
+        abilities_count = len(abilities) if isinstance(abilities, list) else 0
+        return {
+            "age": int(row["age"]) if row["age"] is not None else None,
+            "level": int(row["level"]) if row["level"] is not None else None,
+            "inventory_count": inventory_count,
+            "abilities_count": abilities_count,
+            "updated_at": row["updated_at"],
         }
 
     def get_kpis(self, book_id: str) -> dict[str, Any]:
@@ -1341,6 +1563,47 @@ class DashboardRepository:
 
         return self.get_decision_request(request_id)
 
+    def add_auto_role_generation_event(
+        self,
+        *,
+        book_id: str,
+        trigger: str,
+        result: AutoRoleGenerationResult,
+        scene_id: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO auto_role_generation_events(
+                    book_id,
+                    trigger,
+                    scene_id,
+                    created_count,
+                    skipped_count,
+                    failed_count,
+                    created_json,
+                    skipped_json,
+                    failed_json,
+                    duration_ms,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    book_id,
+                    trigger,
+                    scene_id,
+                    len(result.created),
+                    len(result.skipped),
+                    len(result.failed),
+                    json.dumps(result.created, ensure_ascii=False),
+                    json.dumps(result.skipped, ensure_ascii=False),
+                    json.dumps(result.failed, ensure_ascii=False),
+                    float(result.duration_ms),
+                    now,
+                ),
+            )
+
 
 @dataclass(slots=True)
 class SceneRunController:
@@ -1526,6 +1789,9 @@ class SceneRunManager:
                     selected_option=decision["recommended_option"],
                     selected_source="system_interrupt",
                 )
+            with controller.lock:
+                if controller.pending_decision_id == pending_decision_id:
+                    controller.pending_decision_id = None
 
         self._repo.add_intervention(
             run_id=controller.run_id,
@@ -1618,7 +1884,7 @@ class SceneRunManager:
         final_summary: dict[str, Any] = {}
 
         try:
-            agents = self._factory.create_agents_from_dir()
+            agents = self._factory.create_agents_for_book(controller.book_id)
             orchestrator = self._factory.create_orchestrator()
 
             missing_participants = [
@@ -1710,6 +1976,18 @@ class SceneRunManager:
                     if decision is None:
                         continue
 
+                state_update_events = self._process_character_updates(
+                    controller=controller,
+                    orchestrator=orchestrator,
+                    decision=decision,
+                    agents=agents,
+                    turn=turn,
+                    settings=settings,
+                    revision_snapshot=revision_snapshot,
+                )
+                if state_update_events is None:
+                    continue
+
                 state = _deep_merge_dicts(state, decision.state_delta)
                 state["unresolved_conflicts"] = _update_unresolved_conflicts(
                     existing=list(state.get("unresolved_conflicts", [])),
@@ -1734,6 +2012,10 @@ class SceneRunManager:
                 controller.history_events.append(
                     f"Turn {turn} {actor_id}: {decision.resolved_action.action} / {decision.resolved_action.speech}"
                 )
+                if state_update_events:
+                    controller.history_events.append(
+                        f"Turn {turn} state_updates: {len(state_update_events)} event(s)"
+                    )
 
                 if controller.last_actor == actor_id:
                     controller.consecutive_turns += 1
@@ -1843,6 +2125,7 @@ class SceneRunManager:
             recommended_option=recommended_option,
             expires_at=expires_at,
             metadata={
+                "decision_type": "action_resolution",
                 "director_conflict": director_decision.conflict,
                 "director_confidence": director_decision.confidence,
             },
@@ -1866,14 +2149,41 @@ class SceneRunManager:
         started = time.time()
         while True:
             if controller.stop_event.is_set():
+                self._cleanup_pending_decision(
+                    controller=controller,
+                    request_id=request["request_id"],
+                    turn=turn,
+                    recommended_option=recommended_option,
+                    selected_source="system_stop",
+                    intervention_kind="decision_aborted",
+                    metadata={"reason": "worker_stopped"},
+                )
                 return None
 
             with controller.lock:
                 changed = controller.revision != revision_snapshot
                 current_pending = controller.pending_decision_id
             if changed:
+                self._cleanup_pending_decision(
+                    controller=controller,
+                    request_id=request["request_id"],
+                    turn=turn,
+                    recommended_option=recommended_option,
+                    selected_source="system_revision",
+                    intervention_kind="decision_aborted",
+                    metadata={"reason": "revision_changed"},
+                )
                 return None
             if current_pending != request["request_id"]:
+                self._cleanup_pending_decision(
+                    controller=controller,
+                    request_id=request["request_id"],
+                    turn=turn,
+                    recommended_option=recommended_option,
+                    selected_source="system_superseded",
+                    intervention_kind="decision_aborted",
+                    metadata={"reason": "pending_decision_replaced"},
+                )
                 return None
 
             decision_row = self._repo.get_decision_request(request["request_id"])
@@ -1933,6 +2243,265 @@ class SceneRunManager:
 
             time.sleep(0.25)
 
+    def _process_character_updates(
+        self,
+        *,
+        controller: SceneRunController,
+        orchestrator: Any,
+        decision: DirectorDecision,
+        agents: dict[str, Any],
+        turn: int,
+        settings: dict[str, Any],
+        revision_snapshot: int,
+    ) -> list[dict[str, Any]] | None:
+        cfg = self._factory.config.character_state
+        if not bool(getattr(cfg, "enabled", True)):
+            return []
+
+        max_updates = max(1, int(getattr(cfg, "max_updates_per_turn", 8)))
+        threshold = max(0.0, min(1.0, float(getattr(cfg, "auto_apply_confidence", 0.75))))
+        uncertainty_enabled = bool(settings.get("uncertainty_enabled"))
+        events: list[dict[str, Any]] = []
+
+        for update in decision.character_updates[:max_updates]:
+            if update.target not in agents:
+                event = orchestrator.apply_character_update_event(
+                    book_id=controller.book_id,
+                    scene_id=controller.scene_id,
+                    turn=turn,
+                    update=update,
+                    applied_status="invalid_target",
+                    source="director_async",
+                    apply=False,
+                )
+                events.append(event)
+                continue
+
+            if float(update.confidence) >= threshold:
+                event = orchestrator.apply_character_update_event(
+                    book_id=controller.book_id,
+                    scene_id=controller.scene_id,
+                    turn=turn,
+                    update=update,
+                    applied_status="applied_auto",
+                    source="director_async",
+                    apply=True,
+                )
+                events.append(event)
+                continue
+
+            if not uncertainty_enabled:
+                event = orchestrator.apply_character_update_event(
+                    book_id=controller.book_id,
+                    scene_id=controller.scene_id,
+                    turn=turn,
+                    update=update,
+                    applied_status="skipped_low_confidence",
+                    source="director_async",
+                    apply=False,
+                )
+                events.append(event)
+                continue
+
+            decision_choice = self._resolve_uncertain_state_update(
+                controller=controller,
+                turn=turn,
+                revision_snapshot=revision_snapshot,
+                update=update,
+                timeout_seconds=int(settings.get("decision_timeout_seconds") or 60),
+                threshold=threshold,
+            )
+            if decision_choice is None:
+                return None
+
+            selected_option, selected_source = decision_choice
+            apply = selected_option == "state_update_apply"
+            applied_status = (
+                "applied_user" if apply and selected_source == "user"
+                else "applied_timeout_auto" if apply
+                else "discarded_user" if selected_source == "user"
+                else "discarded_timeout_auto"
+            )
+            event = orchestrator.apply_character_update_event(
+                book_id=controller.book_id,
+                scene_id=controller.scene_id,
+                turn=turn,
+                update=update,
+                applied_status=applied_status,
+                source=f"director_async:{selected_source}",
+                apply=apply,
+            )
+            events.append(event)
+
+        return events
+
+    def _resolve_uncertain_state_update(
+        self,
+        *,
+        controller: SceneRunController,
+        turn: int,
+        revision_snapshot: int,
+        update: CharacterStateUpdate,
+        timeout_seconds: int,
+        threshold: float,
+    ) -> tuple[str, str] | None:
+        options, recommended_option = _build_state_update_decision_options(update, threshold=threshold)
+        question = (
+            f"导演建议更新角色 `{update.target}` 的动态状态，置信度 {update.confidence:.2f}。"
+            "是否应用该变更？"
+        )
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(5, timeout_seconds))
+        request = self._repo.create_decision_request(
+            run_id=controller.run_id,
+            book_id=controller.book_id,
+            scene_id=controller.scene_id,
+            turn=turn,
+            question=question,
+            options=options,
+            recommended_option=recommended_option,
+            expires_at=expires_at,
+            metadata={
+                "decision_type": "character_state_update",
+                "target": update.target,
+                "confidence": update.confidence,
+                "changes": update.changes,
+                "reason": update.reason,
+            },
+        )
+
+        with controller.lock:
+            controller.pending_decision_id = request["request_id"]
+
+        self._repo.update_run_session(
+            controller.run_id,
+            status="waiting_user",
+            current_turn=controller.completed_turns,
+        )
+        self._repo.upsert_scene_control(
+            controller.book_id,
+            controller.scene_id,
+            "waiting_user",
+            message="awaiting creator decision for state update",
+        )
+
+        started = time.time()
+        while True:
+            if controller.stop_event.is_set():
+                self._cleanup_pending_decision(
+                    controller=controller,
+                    request_id=request["request_id"],
+                    turn=turn,
+                    recommended_option=recommended_option,
+                    selected_source="system_stop",
+                    intervention_kind="state_update_aborted",
+                    metadata={"reason": "worker_stopped", "target": update.target},
+                )
+                return None
+
+            with controller.lock:
+                changed = controller.revision != revision_snapshot
+                current_pending = controller.pending_decision_id
+            if changed:
+                self._cleanup_pending_decision(
+                    controller=controller,
+                    request_id=request["request_id"],
+                    turn=turn,
+                    recommended_option=recommended_option,
+                    selected_source="system_revision",
+                    intervention_kind="state_update_aborted",
+                    metadata={"reason": "revision_changed", "target": update.target},
+                )
+                return None
+            if current_pending != request["request_id"]:
+                self._cleanup_pending_decision(
+                    controller=controller,
+                    request_id=request["request_id"],
+                    turn=turn,
+                    recommended_option=recommended_option,
+                    selected_source="system_superseded",
+                    intervention_kind="state_update_aborted",
+                    metadata={"reason": "pending_decision_replaced", "target": update.target},
+                )
+                return None
+
+            decision_row = self._repo.get_decision_request(request["request_id"])
+            if decision_row is None:
+                return None
+
+            if decision_row["status"] != "pending":
+                selected = decision_row["selected_option"] or recommended_option
+                selected_source = decision_row["selected_source"] or "user"
+                with controller.lock:
+                    controller.pending_decision_id = None
+                self._repo.update_run_session(
+                    controller.run_id,
+                    status="running",
+                    current_turn=controller.completed_turns,
+                )
+                self._repo.upsert_scene_control(controller.book_id, controller.scene_id, "running")
+                return selected, selected_source
+
+            elapsed = time.time() - started
+            if elapsed >= timeout_seconds:
+                auto = self._repo.resolve_decision_request(
+                    request["request_id"],
+                    selected_option=recommended_option,
+                    selected_source="timeout_auto",
+                )
+                if auto is None:
+                    return None
+                with controller.lock:
+                    controller.pending_decision_id = None
+                self._repo.add_intervention(
+                    run_id=controller.run_id,
+                    book_id=controller.book_id,
+                    scene_id=controller.scene_id,
+                    turn=turn,
+                    kind="state_update_timeout_auto",
+                    content=recommended_option,
+                    metadata={"request_id": request["request_id"], "target": update.target},
+                )
+                self._repo.update_run_session(
+                    controller.run_id,
+                    status="running",
+                    current_turn=controller.completed_turns,
+                )
+                self._repo.upsert_scene_control(controller.book_id, controller.scene_id, "running")
+                return recommended_option, "timeout_auto"
+
+            time.sleep(0.25)
+
+    def _cleanup_pending_decision(
+        self,
+        *,
+        controller: SceneRunController,
+        request_id: str,
+        turn: int,
+        recommended_option: str,
+        selected_source: str,
+        intervention_kind: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        request = self._repo.get_decision_request(request_id)
+        if request and request.get("status") == "pending":
+            self._repo.resolve_decision_request(
+                request_id,
+                selected_option=recommended_option,
+                selected_source=selected_source,
+            )
+            self._repo.add_intervention(
+                run_id=controller.run_id,
+                book_id=controller.book_id,
+                scene_id=controller.scene_id,
+                turn=turn,
+                kind=intervention_kind,
+                content=recommended_option,
+                metadata={"request_id": request_id, **(metadata or {})},
+            )
+        with controller.lock:
+            if controller.pending_decision_id == request_id:
+                controller.pending_decision_id = None
+
 
 def create_dashboard_app(
     *,
@@ -1952,6 +2521,7 @@ def create_dashboard_app(
     run_locks: dict[str, threading.Lock] = {}
     run_locks_guard = threading.Lock()
     run_manager = SceneRunManager(factory=factory, repo=repo)
+    auto_character_service = AutoCharacterService(factory)
 
     def _get_book_lock(book_id: str) -> threading.Lock:
         with run_locks_guard:
@@ -1961,6 +2531,37 @@ def create_dashboard_app(
             created = threading.Lock()
             run_locks[book_id] = created
             return created
+
+    def _run_auto_role_generation(
+        *,
+        book_id: str,
+        trigger: Literal["profile_save", "scene_start"],
+        scene_input: dict[str, Any] | None = None,
+    ) -> AutoRoleGenerationResult | None:
+        config = factory.config.auto_character
+        if not config.enabled:
+            return None
+        if trigger == "profile_save" and not config.trigger_on_profile_save:
+            return None
+        if trigger == "scene_start" and not config.trigger_on_scene_start:
+            return None
+
+        profile = repo.get_book_profile(book_id)
+        result = auto_character_service.generate(
+            book_id=book_id,
+            profile=profile,
+            trigger=trigger,
+            scene_input=scene_input,
+        )
+        repo.add_auto_role_generation_event(
+            book_id=book_id,
+            trigger=trigger,
+            scene_id=str(scene_input.get("scene_id")).strip()
+            if isinstance(scene_input, dict) and str(scene_input.get("scene_id", "")).strip()
+            else None,
+            result=result,
+        )
+        return result
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -1999,17 +2600,27 @@ def create_dashboard_app(
                 detail="New book creation requires `profile` with 8 required fields",
             )
 
+        auto_roles: dict[str, Any] | None = None
         try:
             book = repo.ensure_book(request.book_id, request.title)
             if request.profile is not None:
                 repo.upsert_book_profile(book["book_id"], request.profile.model_dump())
+                auto_result = _run_auto_role_generation(
+                    book_id=book["book_id"],
+                    trigger="profile_save",
+                )
+                if auto_result is not None:
+                    auto_roles = auto_result.to_dict()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        return {
+        response = {
             **book,
             "profile_completed": repo.get_book_profile(book["book_id"]) is not None,
         }
+        if auto_roles is not None:
+            response["auto_roles"] = auto_roles
+        return response
 
     @app.post("/api/books/{book_id}/activate")
     def activate_book(book_id: str) -> dict[str, Any]:
@@ -2023,7 +2634,14 @@ def create_dashboard_app(
     def patch_book_profile(book_id: str, body: BookProfilePatchRequest) -> dict[str, Any]:
         updates = body.model_dump(exclude_none=True)
         try:
-            return repo.patch_book_profile(book_id, updates)
+            updated = repo.patch_book_profile(book_id, updates)
+            auto_result = _run_auto_role_generation(
+                book_id=updated["book_id"],
+                trigger="profile_save",
+            )
+            if auto_result is not None:
+                updated["auto_roles"] = auto_result.to_dict()
+            return updated
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2071,6 +2689,13 @@ def create_dashboard_app(
     ) -> dict[str, Any]:
         return {"book_id": book_id, "items": repo.list_agents_progress(book_id)}
 
+    @app.get("/api/dashboard/agents/{agent_id}/state")
+    def get_agent_runtime_state(
+        agent_id: str,
+        book_id: str = Query(default=DEFAULT_BOOK_ID, min_length=1),
+    ) -> dict[str, Any]:
+        return repo.get_agent_runtime_state(book_id=book_id, agent_id=agent_id)
+
     @app.get("/api/dashboard/costs")
     def get_costs(
         book_id: str = Query(default=DEFAULT_BOOK_ID, min_length=1),
@@ -2094,9 +2719,32 @@ def create_dashboard_app(
         control = repo.get_scene_control(request.book_id, request.scene_id)
         if control and control.get("status") == "paused":
             raise HTTPException(status_code=409, detail="Scene is paused. Resume before start.")
+        if run_manager.is_book_busy(request.book_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Another async run is in progress for book `{request.book_id}`",
+            )
+
+        auto_result = _run_auto_role_generation(
+            book_id=request.book_id,
+            trigger="scene_start",
+            scene_input={
+                "scene_id": request.scene_id,
+                "title": request.title,
+                "objective": request.objective,
+                "context": request.context,
+                "participants": list(request.participants),
+            },
+        )
         try:
-            session = run_manager.start_async(request)
-            return {
+            participants = _resolve_participants(factory, request.book_id, request.participants)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        normalized_request = request.model_copy(update={"participants": participants})
+        try:
+            session = run_manager.start_async(normalized_request)
+            response = {
                 "book_id": request.book_id,
                 "scene_id": request.scene_id,
                 "run_id": session["run_id"],
@@ -2104,6 +2752,9 @@ def create_dashboard_app(
                 "current_turn": session["current_turn"],
                 "target_turns": session["target_turns"],
             }
+            if auto_result is not None:
+                response["auto_roles"] = auto_result.to_dict()
+            return response
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -2133,15 +2784,27 @@ def create_dashboard_app(
             [],
             profile_context=profile_context,
         )
-        repo.upsert_scene_control(request.book_id, request.scene_id, "running")
         try:
-            agents = factory.create_agents_from_dir()
+            auto_result = _run_auto_role_generation(
+                book_id=request.book_id,
+                trigger="scene_start",
+                scene_input={
+                    "scene_id": request.scene_id,
+                    "title": request.title,
+                    "objective": request.objective,
+                    "context": request.context,
+                    "participants": list(request.participants),
+                },
+            )
+            participants = _resolve_participants(factory, request.book_id, request.participants)
+            repo.upsert_scene_control(request.book_id, request.scene_id, "running")
+            agents = factory.create_agents_for_book(request.book_id)
             scene = SceneInput(
                 book_id=request.book_id,
                 scene_id=request.scene_id,
                 title=request.title,
                 objective=request.objective,
-                participants=request.participants,
+                participants=participants,
                 context=merged_context,
                 state=request.state,
                 max_turns=request.max_turns,
@@ -2152,7 +2815,7 @@ def create_dashboard_app(
             next_status = "completed" if result.status == "objective_achieved" else "ready"
             repo.upsert_scene_control(request.book_id, request.scene_id, next_status)
 
-            return {
+            response = {
                 "book_id": request.book_id,
                 "scene_id": result.scene_id,
                 "status": result.status,
@@ -2160,6 +2823,12 @@ def create_dashboard_app(
                 "final_state": result.final_state,
                 "stop_reason": result.stop_reason,
             }
+            if auto_result is not None:
+                response["auto_roles"] = auto_result.to_dict()
+            return response
+        except ValueError as exc:
+            repo.upsert_scene_control(request.book_id, request.scene_id, "ready", message=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - exercised by API layer tests
             repo.upsert_scene_control(request.book_id, request.scene_id, "failed", message=str(exc))
             raise HTTPException(status_code=500, detail=f"Scene start failed: {exc}") from exc
@@ -2297,6 +2966,73 @@ def _parse_safe_datetime(raw: Any) -> datetime | None:
     return parsed
 
 
+def _normalize_participant_alias(value: str) -> str:
+    text = value.strip()
+    text = re.sub(r"\s+", "", text)
+    return text.casefold()
+
+
+def _build_agent_alias_map(factory: AgentFactory, book_id: str) -> tuple[dict[str, str], list[str]]:
+    alias_to_agent: dict[str, str] = {}
+    available: list[str] = []
+
+    try:
+        skills = factory.load_skills_for_book(book_id)
+    except Exception:
+        return alias_to_agent, available
+
+    for skill in skills.values():
+        agent_id = skill.agent_id
+        available.append(agent_id)
+        alias_candidates = [
+            agent_id,
+            skill.display_name,
+            skill.identity.get("姓名", ""),
+            skill.identity.get("称呼", ""),
+        ]
+        for candidate in alias_candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            normalized = _normalize_participant_alias(text)
+            alias_to_agent.setdefault(normalized, agent_id)
+
+    available = sorted(set(available))
+    return alias_to_agent, available
+
+
+def _resolve_participants(factory: AgentFactory, book_id: str, participants: list[str]) -> list[str]:
+    alias_to_agent, available_agents = _build_agent_alias_map(factory, book_id)
+    resolved: list[str] = []
+    missing: list[str] = []
+
+    for raw in participants:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        normalized = _normalize_participant_alias(text)
+        agent_id = alias_to_agent.get(normalized)
+        if agent_id is None:
+            missing.append(text)
+            continue
+        if agent_id not in resolved:
+            resolved.append(agent_id)
+
+    if missing:
+        available_text = ", ".join(available_agents) if available_agents else "(none)"
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"Participants missing in agents: [{missing_text}]. "
+            f"Available agent_id: {available_text}. "
+            "You can input agent_id, 姓名, or 称呼."
+        )
+
+    if not resolved:
+        raise ValueError("participants cannot be empty")
+
+    return resolved
+
+
 def _normalize_profile_payload(profile: dict[str, Any], *, require_complete: bool) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for key in BOOK_PROFILE_FIELD_KEYS:
@@ -2412,6 +3148,28 @@ def _build_decision_options(
     return options, "accept_director"
 
 
+def _build_state_update_decision_options(
+    update: CharacterStateUpdate,
+    *,
+    threshold: float,
+) -> tuple[list[dict[str, str]], str]:
+    options = [
+        {
+            "id": "state_update_apply",
+            "label": "应用状态变更",
+            "description": "接受导演更新并立即写入角色动态状态。",
+        },
+        {
+            "id": "state_update_discard",
+            "label": "忽略本次变更",
+            "description": "不应用该更新，保持当前角色动态状态不变。",
+        },
+    ]
+    if float(update.confidence) >= max(0.0, threshold - 0.1):
+        return options, "state_update_apply"
+    return options, "state_update_discard"
+
+
 def _apply_user_decision_choice(
     selected_option: str,
     *,
@@ -2427,6 +3185,7 @@ def _apply_user_decision_choice(
             conflict=None,
             rationale=f"user_selected:{source}; use actor proposal",
             confidence=0.85,
+            character_updates=copy.deepcopy(director_decision.character_updates),
         )
 
     if selected_option == "conservative_rewrite":
@@ -2451,6 +3210,7 @@ def _apply_user_decision_choice(
             conflict=None,
             rationale=f"user_selected:{source}; conservative rewrite",
             confidence=0.8,
+            character_updates=copy.deepcopy(director_decision.character_updates),
         )
 
     return DirectorDecision(
@@ -2460,6 +3220,7 @@ def _apply_user_decision_choice(
         conflict=director_decision.conflict,
         rationale=f"user_selected:{source}; accept director",
         confidence=max(0.7, float(director_decision.confidence)),
+        character_updates=copy.deepcopy(director_decision.character_updates),
     )
 
 

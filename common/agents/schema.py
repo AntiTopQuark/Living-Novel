@@ -101,6 +101,80 @@ class ActionValidationError(ValueError):
 
 
 @dataclass(slots=True)
+class CharacterRuntimeState:
+    book_id: str
+    agent_id: str
+    age: int | None = None
+    personality_traits: list[str] = field(default_factory=list)
+    inventory: list[str] = field(default_factory=list)
+    level: int | None = None
+    abilities: list[str] = field(default_factory=list)
+    extras: dict[str, Any] = field(default_factory=dict)
+    updated_at: datetime | None = None
+    updated_turn: int = 0
+
+    def to_summary_text(self) -> str:
+        parts: list[str] = []
+        if self.age is not None:
+            parts.append(f"年龄={self.age}")
+        if self.level is not None:
+            parts.append(f"等级={self.level}")
+        if self.personality_traits:
+            parts.append(f"性格特质={','.join(self.personality_traits)}")
+        if self.inventory:
+            parts.append(f"持有物品={','.join(self.inventory)}")
+        if self.abilities:
+            parts.append(f"能力={','.join(self.abilities)}")
+        if self.extras:
+            parts.append(f"扩展={json.dumps(self.extras, ensure_ascii=False)}")
+        if not parts:
+            return "- 无动态变化"
+        return "- " + "; ".join(parts)
+
+
+@dataclass(slots=True)
+class CharacterStateUpdate:
+    target: str
+    confidence: float
+    reason: str
+    changes: dict[str, Any]
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        default_confidence: float,
+    ) -> "CharacterStateUpdate":
+        target = _as_text(payload.get("target")).strip()
+        if not target:
+            raise ActionValidationError("character_update.target is required")
+
+        reason = _as_text(payload.get("reason")).strip() or "director state update"
+        confidence_raw = payload.get("confidence", default_confidence)
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError) as exc:
+            raise ActionValidationError("character_update.confidence must be a number") from exc
+        confidence = max(0.0, min(confidence, 1.0))
+
+        raw_changes = payload.get("changes")
+        if not isinstance(raw_changes, dict):
+            raise ActionValidationError("character_update.changes must be an object")
+
+        normalized_changes = _normalize_state_changes(raw_changes)
+        if not normalized_changes:
+            raise ActionValidationError("character_update.changes cannot be empty")
+
+        return cls(
+            target=target,
+            confidence=confidence,
+            reason=reason,
+            changes=normalized_changes,
+        )
+
+
+@dataclass(slots=True)
 class CharacterSkill:
     agent_id: str
     source_path: str | None
@@ -227,6 +301,7 @@ class DirectorDecision:
     conflict: str | None = None
     rationale: str = ""
     confidence: float = 1.0
+    character_updates: list[CharacterStateUpdate] = field(default_factory=list)
 
     @classmethod
     def from_payload(
@@ -264,6 +339,21 @@ class DirectorDecision:
             confidence_value = 1.0
         confidence_value = max(0.0, min(confidence_value, 1.0))
 
+        raw_updates = payload.get("character_updates", [])
+        updates: list[CharacterStateUpdate] = []
+        if raw_updates not in (None, []):
+            if not isinstance(raw_updates, list):
+                raise ActionValidationError("character_updates must be a list when provided")
+            for item in raw_updates:
+                if not isinstance(item, dict):
+                    raise ActionValidationError("each character_update must be an object")
+                updates.append(
+                    CharacterStateUpdate.from_payload(
+                        item,
+                        default_confidence=confidence_value,
+                    )
+                )
+
         return cls(
             accepted=accepted_value,
             resolved_action=resolved_action,
@@ -271,6 +361,7 @@ class DirectorDecision:
             conflict=conflict_value,
             rationale=rationale,
             confidence=confidence_value,
+            character_updates=updates,
         )
 
 
@@ -331,3 +422,43 @@ def _as_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _normalize_state_changes(raw_changes: dict[str, Any]) -> dict[str, Any]:
+    allowed_keys = {
+        "age",
+        "personality_traits_add",
+        "personality_traits_remove",
+        "inventory_add",
+        "inventory_remove",
+        "level_set",
+        "level_delta",
+        "abilities_add",
+        "abilities_remove",
+        "extras_set",
+        "extras_remove",
+    }
+
+    normalized: dict[str, Any] = {}
+    extra_fields: dict[str, Any] = {}
+    for key, value in raw_changes.items():
+        normalized_key = _as_text(key).strip()
+        if not normalized_key:
+            continue
+        if normalized_key in allowed_keys:
+            normalized[normalized_key] = value
+        else:
+            extra_fields[normalized_key] = value
+
+    if extra_fields:
+        extras_set = normalized.get("extras_set")
+        if extras_set is None:
+            normalized["extras_set"] = dict(extra_fields)
+        elif isinstance(extras_set, dict):
+            merged = dict(extras_set)
+            merged.update(extra_fields)
+            normalized["extras_set"] = merged
+        else:
+            raise ActionValidationError("changes.extras_set must be an object")
+
+    return normalized
